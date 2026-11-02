@@ -27,7 +27,7 @@ const edit = worktree => fs.writeFileSync(path.join(worktree, 'mods/panel/main.j
 const remove = f => fs.rmSync(f.root, { recursive: true, force: true });
 test('repair boundary rejects protected paths, traversal, binary and unsafe operations', () => {
   for (const file of ['../outside.js', 'scripts/repair-herdr.cjs', 'native/herdr-app/src/diagnostics.rs', 'native/herdr-app/src/main.rs', 'mods/a/../../key.js']) assert.throws(() => validatePatch([file], '+safe'));
-  for (const patch of ['+fetch(url)', 'GIT binary patch', 'new file mode 120000', '+spawn(command)', 'deleted file mode 100644']) assert.throws(() => validatePatch(['mods/panel/main.js'], patch));
+  for (const patch of ['+fetch(url)', 'GIT binary patch', 'new file mode 120000', '+spawn(command)', '+fs.writeFileSync(target, data)', '+std::fs::write(path, bytes)', '+process.exit(0)', 'deleted file mode 100644']) assert.throws(() => validatePatch(['mods/panel/main.js'], patch));
   validatePatch(['mods/panel/main.js'], '+const safe = values?.length ?? 0;');
   assert.equal(inside('C:/safe', 'C:/safe-other/file'), false);
 });

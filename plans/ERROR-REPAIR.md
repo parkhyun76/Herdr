@@ -70,5 +70,14 @@ automatic detection, recovery, and verified improvements.
   31 live AI identities retained, restore issues and current app errors empty.
 - Native candidate installer verified against a disposable executable: checksum
   rejection and successful lease-checked replacement with backup both passed.
-- Full source snapshot matches the tested native runtime source. GitHub upload and
-  repair activation are the remaining delivery steps; runtime artifacts stay local.
+- Full source snapshot matches the tested native runtime source. Source published
+  to the private `parkhyun76/Herdr` main branch; initial source commit `724c1abc`.
+  Staged files and all committed history passed Gitleaks scanning. The public pinned
+  Ghostty submodule is a gitlink, with its commit verified on GitHub.
+- Repair is enabled on this PC with the real source checkout and native Codex CLI.
+  A further live disposable mod probe exercised the entire automatic path: native
+  error detection -> queued worker -> actual Codex proposal -> new regression test
+  -> verified source fast-forward -> installed mod hot reload -> independent result
+  check. All passed; temporary source/mod/space were isolated from user projects.
+  The temporary worker checkout was removed with its owning Git repository; normal
+  repair configuration and focus were restored. Detailed evidence is kept locally.

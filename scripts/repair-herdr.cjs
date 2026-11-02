@@ -41,6 +41,7 @@ function validatePatch(files, patch) {
   if (/GIT binary patch|Binary files .* differ|new file mode 120000|new mode 120000|deleted file mode|new file mode 160000/.test(patch)) throw new Error('Binary, link and file deletion repairs require review.');
   const additions = patch.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++')).join('\n');
   if (/child_process|\b(?:eval|exec|spawn|fetch|WebSocket|Command::new|remove_dir_all|process::exit)\s*\(|powershell|cmd\.exe|https?:\/\/|\.env\b|authorization|api[_-]?key|password|\.send\s*\(/i.test(additions)) throw new Error('Repair adds protected process, network or credential operations.');
+  if (/\b(?:writeFile(?:Sync)?|appendFile(?:Sync)?|rmSync|unlink(?:Sync)?|rmdir(?:Sync)?|mkdir(?:Sync)?|chmod(?:Sync)?|chown(?:Sync)?|symlink(?:Sync)?|rename(?:Sync)?|copyFile(?:Sync)?|Function)\s*\(|std::(?:fs|process|net)|\bunsafe\b|\bprocess\.|\.constructor\b|__proto__/i.test(additions)) throw new Error('Repair adds protected filesystem or execution operations.');
 }
 function assertLease(repo, head) {
   clean(repo);
@@ -93,7 +94,7 @@ function propose(worktree, incident, config, job) {
   const tracked = git(worktree, ['ls-files']).split('\n');
   const names = new Set([incident.source]);
   for (const action of incident.sample?.recent_actions || []) names.add(String(action.command || '').split('.')[0]);
-  const location = JSON.stringify(incident.sample?.details || {});
+  const location = JSON.stringify({details:incident.sample?.details,error:incident.error});
   const selected = tracked.filter(file => allowed(file) && (
     [...names].some(name => /^[\w-]+$/.test(name || '') && file.startsWith(`mods/${name}/`)) ||
     (file.startsWith('native/') && location.includes(file.replace('native/herdr-app/', '')))

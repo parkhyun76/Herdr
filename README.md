@@ -6,6 +6,9 @@ Apache-2.0 및 각 의존성의 라이선스·저작권을 유지한다.
 전체 native 소스는 `native/herdr-app/`, 사용자 UI는 `mods/`에 있다.
 [Windows 빌드·설치](docs/BUILD-WINDOWS.md) · [오류 기록·자동 개선](docs/DIAGNOSTICS.md)
 
+현재 Windows 실행 파일은 [개인 개선판 릴리스](https://github.com/parkhyun76/Herdr/releases/tag/windows-custom-20261102)에서 받는다.
+공식 앱·core와 구분되는 개인 빌드이며 기존 core 설치가 필요하다.
+
 ## 구성
 
 | 경로 | 내용 |
