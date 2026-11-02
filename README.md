@@ -61,6 +61,19 @@ Herdr 안내(`AGENTS.md`)에 따르면 업데이트는 기본 mod·레이아웃�
   `keys.json`에 `"changes-branch:toggle"`을 연결하면 단축키로 쓸 수 있다.
 - 사용 레이아웃 `main-worktree-folding`의 `changes` 블록이 이 mod를 가리킨다.
 
+## Files의 Windows 탐색기 아이콘
+
+로컬 Windows의 Files 패널은 Windows Shell에서 현재 PC의 파일 연결 아이콘을
+가져온다. 폴더·Excel·Word·PDF 등은 탐색기와 같은 컬러 아이콘을 표시하며,
+실행 파일·바로가기·아이콘 파일은 개별 아이콘을 조회한다. 등록되지 않은 형식은
+Windows의 기본 파일 아이콘을 쓴다. 원격 기기와 다른 OS는 기존 아이콘을 유지한다.
+
+`mods/files-utf8/list-windows.ps1`이 백그라운드에서 조회하고 앱 홈의
+`data/files-utf8/windows-icons-v1/`에 내용 해시를 이름으로 PNG를 캐시한다.
+탐색하는 폴더에는 파일을 만들지 않는다. 파일 연결 변경은 다음 목록 갱신에
+다시 조회하며, 아이콘 조회 실패는 패널 하단에 표시하고 기존 아이콘을 사용한다.
+설치는 `scripts/deploy-mods.ps1`에 포함되며 앱 재시작이 필요 없다.
+
 ## Windows AI 대화 자동 복원
 
 사용자 native 빌드에 대화 연결 저장 기능을 추가했다. Claude Code·Codex의 정확한
