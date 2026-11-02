@@ -1,0 +1,321 @@
+diff --git a/defaults/AGENTS.md b/defaults/AGENTS.md
+--- a/defaults/AGENTS.md
++++ b/defaults/AGENTS.md
+@@ -548,8 +548,10 @@ The main ones:
+   right-click targeting follow keyboard focus, including peek and floating terminals;
+   with no terminal holding keyboard focus, they use the focused pane or block.
+   Dragging a text selection past the terminal's top or bottom scrolls while held;
+-  releasing stops it. Programs that track the mouse still get their mouse events
+-  (hold Shift to select text instead). A drag stays with the terminal where it
++  releasing stops it. On Windows, left drags select and copy in this window;
++  ordinary clicks still reach mouse-tracking programs on release. Hold Ctrl to
++  send a drag to the program instead. On other systems, mouse-tracking programs
++  get their mouse events (hold Shift to select text instead). A drag stays with the terminal where it
+   started, including its release outside the pane; other panes don't receive it.
+   Terminals display Kitty graphics, including Unicode placeholder images used by
+   programs such as yazi; partial images and scrolling follow the placeholder cells.
+diff --git a/src/terminal.rs b/src/terminal.rs
+index e6cfb5a..7908275 100644
+--- a/src/terminal.rs
++++ b/src/terminal.rs
+@@ -85,6 +85,8 @@ pub struct TerminalView {
+     selecting: bool,
+     selection_pointer: Point<Pixels>,
+     selection_scroll: Option<Task<()>>,
++    /// Windows buffers a program's click while a drag can become a local selection.
++    deferred_click: Option<(Point<Pixels>, Modifiers)>,
+     /// The terminal's folder, for links to relative paths.
+     pub cwd: Option<PathBuf>,
+     /// The link under the pointer while the link modifier is held.
+@@ -182,6 +184,7 @@ impl TerminalView {
+             selecting: false,
+             selection_pointer: Point::default(),
+             selection_scroll: None,
++            deferred_click: None,
+             cwd: None,
+             link: None,
+             right_click_to_program: false,
+@@ -680,11 +683,21 @@ impl TerminalView {
+ 
+     fn finish_selection(&mut self, pos: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+         self.selecting = false;
++        let click = self.deferred_click.take();
+         let mut g = self.grid.borrow_mut();
+         g.buttons_down.retain(|b| *b != MouseButton::Left);
+         if let Some(pos) = pos {
+             drop(g);
+             self.select(Select::Release, pos, cx);
++            // A plain click still reaches the program. A text selection is copied
++            // by this window, even when the program runs in a service session.
++            let has_selection = self.grid.borrow().vt.selection_text().is_some();
++            if let Some((press, mods)) = click
++                && !has_selection
++            {
++                self.mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(MouseButton::Left), press, mods);
++                self.mouse(GHOSTTY_MOUSE_ACTION_RELEASE, Some(MouseButton::Left), pos, mods);
++            }
+         } else {
+             g.vt.clear_selection();
+             cx.notify();
+@@ -714,6 +727,10 @@ fn selection_scroll_lines(y: f32, cell_height: f32, rows: u16) -> isize {
+     (outside / cell_height).abs().ceil().clamp(1.0, 5.0) as isize * if outside < 0.0 { -1 } else { 1 }
+ }
+ 
++fn local_left_selection(windows: bool, program_takes_mouse: bool, control: bool) -> bool {
++    !program_takes_mouse || (windows && !control)
++}
++
+ /// A title as it's shown: an agent's spinner in front of it (`\u{2733} Fix the
+ /// tests`, braille dots) is no part of it. Herdr draws its own, and a title
+ /// that spins would redraw every mod that shows titles, 10 times a second.
+@@ -1388,8 +1405,12 @@ impl Render for TerminalView {
+                     }
+                     return;
+                 }
+-                if !this.mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(ev.button), ev.position, ev.modifiers) {
++                let program_takes_mouse = this.takes_mouse(ev.modifiers);
++                if local_left_selection(cfg!(windows), program_takes_mouse, ev.modifiers.control) {
++                    this.deferred_click = program_takes_mouse.then_some((ev.position, ev.modifiers));
+                     this.start_selection(ev.position, cx);
++                } else {
++                    this.mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(ev.button), ev.position, ev.modifiers);
+                 }
+             }))
+             // Right-click is Herdr's menu, even when the program tracks the mouse
+@@ -1510,6 +1531,20 @@ impl Focusable for TerminalView {
+ 
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn windows_drag_copies_locally_while_control_preserves_program_mouse() {
++        use super::local_left_selection;
++        assert!(local_left_selection(true, true, false));
++        assert!(!local_left_selection(true, true, true));
++        for windows in [false, true] {
++            for control in [false, true] {
++                assert!(local_left_selection(windows, false, control));
++            }
++        }
++        assert!(!local_left_selection(false, true, false));
++        assert!(!local_left_selection(false, true, true));
++    }
++
+     #[test]
+     fn mouse_buttons_only_follow_the_pane_that_took_each_press() {
+         use super::*;
+diff --git a/vendor/gpui-pre-windows/src/clipboard.rs b/vendor/gpui-pre-windows/src/clipboard.rs
+index 11eb2a8..0abebc1 100644
+--- a/vendor/gpui-pre-windows/src/clipboard.rs
++++ b/vendor/gpui-pre-windows/src/clipboard.rs
+@@ -4,7 +4,7 @@ use anyhow::Result;
+ use collections::FxHashMap;
+ use itertools::Itertools;
+ use windows::Win32::{
+-    Foundation::{HANDLE, HGLOBAL},
++    Foundation::{HANDLE, HGLOBAL, HWND},
+     System::{
+         DataExchange::{
+             CloseClipboard, CountClipboardFormats, EmptyClipboard, EnumClipboardFormats,
+@@ -67,8 +67,9 @@ fn get_clipboard_data(format: u32) -> Option<LockedGlobal> {
+     LockedGlobal::lock(global)
+ }
+ 
+-pub(crate) fn write_to_clipboard(item: ClipboardItem) {
+-    let Some(_clip) = ClipboardGuard::open() else {
++pub(crate) fn write_to_clipboard(item: ClipboardItem, owner: HWND) {
++    // HERDR: EmptyClipboard needs a window owner for reliable SetClipboardData.
++    let Some(_clip) = ClipboardGuard::open(Some(owner)) else {
+         return;
+     };
+ 
+@@ -90,7 +91,7 @@ pub(crate) fn write_to_clipboard(item: ClipboardItem) {
+ }
+ 
+ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
+-    let _clip = ClipboardGuard::open()?;
++    let _clip = ClipboardGuard::open(None)?;
+ 
+     let mut entries = Vec::new();
+     let mut have_text = false;
+@@ -343,14 +344,20 @@ fn gpui_to_image_format(value: ImageFormat) -> Option<image::ImageFormat> {
+ struct ClipboardGuard;
+ 
+ impl ClipboardGuard {
+-    fn open() -> Option<Self> {
+-        match unsafe { OpenClipboard(None) } {
+-            Ok(()) => Some(Self),
+-            Err(e) => {
+-                log::error!("Failed to open clipboard: {e}");
+-                None
++    fn open(owner: Option<HWND>) -> Option<Self> {
++        // HERDR: clipboard managers can briefly hold the clipboard after a copy.
++        // Bound the wait to 250 ms so a stuck owner cannot hang the UI.
++        for attempt in 0..=25 {
++            match unsafe { OpenClipboard(owner) } {
++                Ok(()) => return Some(Self),
++                Err(e) if attempt == 25 => {
++                    log::error!("Failed to open clipboard: {e}");
++                    return None;
++                }
++                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+             }
+         }
++        None
+     }
+ }
+ 
+diff --git a/vendor/gpui-pre-windows/src/platform.rs b/vendor/gpui-pre-windows/src/platform.rs
+index ae879a5..8565b1a 100644
+--- a/vendor/gpui-pre-windows/src/platform.rs
++++ b/vendor/gpui-pre-windows/src/platform.rs
+@@ -1011,7 +1011,7 @@ impl Platform for WindowsPlatform {
+     }
+ 
+     fn write_to_clipboard(&self, item: ClipboardItem) {
+-        write_to_clipboard(item);
++        write_to_clipboard(item, self.handle);
+     }
+ 
+     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
+@@ -1915,6 +1915,8 @@ mod tests {
+ 
+     #[test]
+     fn test_clipboard() {
++        let platform = super::WindowsPlatform::new(true).unwrap();
++        let write_to_clipboard = |item| write_to_clipboard(item, platform.handle);
+         let item = ClipboardItem::new_string("你好，我是张小白".to_string());
+         write_to_clipboard(item.clone());
+         assert_eq!(read_from_clipboard(), Some(item));
+diff --git a/tests/windows_clipboard.rs b/tests/windows_clipboard.rs
+new file mode 100644
+index 0000000..ffe33a8
+--- /dev/null
++++ b/tests/windows_clipboard.rs
+@@ -0,0 +1,127 @@
++#![cfg(windows)]
++
++use gpui::ClipboardItem;
++use std::io::{BufRead, BufReader, Write};
++use std::process::{Command, Stdio};
++
++#[link(name = "user32")]
++unsafe extern "system" {
++    fn GetClipboardOwner() -> *mut std::ffi::c_void;
++    fn OpenClipboard(owner: *mut std::ffi::c_void) -> i32;
++    fn CloseClipboard() -> i32;
++}
++
++fn powershell(script: &str) -> Command {
++    use std::os::windows::process::CommandExt;
++    let mut command = Command::new("powershell.exe");
++    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
++    command.creation_flags(0x08000000);
++    command
++}
++
++// Real Windows clipboard and another process, rather than TestPlatform's cache.
++#[test]
++fn windows_clipboard_cross_process_and_temporary_contention() {
++    let platform = gpui_platform::current_platform(true);
++    let original = platform.read_from_clipboard();
++    struct Restore(std::rc::Rc<dyn gpui::Platform>, Option<ClipboardItem>);
++    impl Drop for Restore {
++        fn drop(&mut self) {
++            if let Some(item) = self.1.take() {
++                self.0.write_to_clipboard(item);
++            }
++        }
++    }
++    let _restore = Restore(platform.clone(), original);
++
++    platform.write_to_clipboard(ClipboardItem::new_string("previous clipboard".into()));
++    let mut holder = powershell(r#"
++Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class ClipLock { [DllImport("user32.dll")] public static extern bool OpenClipboard(IntPtr h); [DllImport("user32.dll")] public static extern bool CloseClipboard(); }'
++Add-Type -AssemblyName System.Windows.Forms
++$owner = [System.Windows.Forms.Form]::new()
++if (-not [ClipLock]::OpenClipboard($owner.Handle)) { exit 2 }
++try { [Console]::WriteLine('locked'); [Console]::Out.Flush(); [void][Console]::ReadLine() } finally { [void][ClipLock]::CloseClipboard() }
++"#).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
++    let mut line = String::new();
++    BufReader::new(holder.stdout.take().unwrap())
++        .read_line(&mut line)
++        .unwrap();
++    assert_eq!(line.trim(), "locked");
++    let unexpectedly_opened = unsafe { OpenClipboard(std::ptr::null_mut()) } != 0;
++    if unexpectedly_opened {
++        unsafe { CloseClipboard() };
++    }
++    let mut release = holder.stdin.take().unwrap();
++    let unlock = std::thread::spawn(move || {
++        std::thread::sleep(std::time::Duration::from_millis(120));
++        writeln!(release, "release").unwrap();
++    });
++    let text = "Herdr 복사 확인 😀\r\nsecond line\t한글";
++    platform.write_to_clipboard(ClipboardItem::new_string(text.into()));
++    unlock.join().unwrap();
++    assert!(holder.wait().unwrap().success());
++    assert!(
++        !unexpectedly_opened,
++        "test process must actually hold the clipboard"
++    );
++    assert_eq!(
++        platform
++            .read_from_clipboard()
++            .and_then(|item| item.text())
++            .as_deref(),
++        Some(text)
++    );
++    assert!(
++        !unsafe { GetClipboardOwner() }.is_null(),
++        "clipboard writes need an owning window"
++    );
++
++    let output = powershell("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::Write((Get-Clipboard -Raw))").output().unwrap();
++    assert!(output.status.success());
++    assert_eq!(String::from_utf8(output.stdout).unwrap(), text);
++
++    assert!(
++        powershell("Set-Clipboard -Value 'external to Herdr'")
++            .status()
++            .unwrap()
++            .success()
++    );
++    assert_eq!(
++        platform
++            .read_from_clipboard()
++            .and_then(|item| item.text())
++            .as_deref(),
++        Some("external to Herdr")
++    );
++    platform.write_to_clipboard(ClipboardItem::new_string("latest copy".into()));
++    assert_eq!(
++        platform
++            .read_from_clipboard()
++            .and_then(|item| item.text())
++            .as_deref(),
++        Some("latest copy")
++    );
++
++    let item =
++        ClipboardItem::new_string_with_json_metadata("text with metadata".into(), vec![3, 4]);
++    platform.write_to_clipboard(item.clone());
++    assert_eq!(platform.read_from_clipboard(), Some(item));
++    platform.write_to_clipboard(ClipboardItem::new_string(String::new()));
++    assert_eq!(
++        platform
++            .read_from_clipboard()
++            .and_then(|item| item.text())
++            .as_deref(),
++        None
++    );
++
++    let image = image::DynamicImage::new_rgba8(2, 3);
++    let mut bytes = std::io::Cursor::new(Vec::new());
++    image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
++    let item = ClipboardItem::new_image(&gpui::Image::from_bytes(
++        gpui::ImageFormat::Png,
++        bytes.into_inner(),
++    ));
++    platform.write_to_clipboard(item.clone());
++    assert_eq!(platform.read_from_clipboard(), Some(item));
++}

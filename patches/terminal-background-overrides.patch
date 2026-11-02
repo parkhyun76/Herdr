@@ -1,0 +1,172 @@
+diff --git a/defaults/AGENTS.md b/defaults/AGENTS.md
+index 00de6b6..012b785 100644
+--- a/defaults/AGENTS.md
++++ b/defaults/AGENTS.md
+@@ -662,6 +662,12 @@ What's about the user, never a look:
+   background; this is a threshold, not a guaranteed resulting ratio.
+   Box/block, Powerline and sprite glyph colors are never adjusted.
+   Changes apply immediately, including text already on screen.
++- `terminal_background_overrides`: optional exact background-color substitutions,
++  e.g. `{"#f4f4f4":"#323436","#f9f9f9":"#36383a"}` for a program that
++  cached a light input background while the app uses a dark theme. Keys and
++  values are `#rrggbb`. Applies live to terminal cell backgrounds only;
++  foreground text, selections, images and unlisted backgrounds stay unchanged.
++  Omit it (the default) to preserve every program-specified background.
+ - `clipboard_write`: `false` blocks terminal programs from writing the local
+   clipboard (default `true`, including remote terminals attached in this window).
+   OSC 52 accepts base64 UTF-8 text up to 1 MiB: `c` writes the system clipboard,
+diff --git a/src/SKILL.md b/src/SKILL.md
+index 5845dfc..2e9771f 100644
+--- a/src/SKILL.md
++++ b/src/SKILL.md
+@@ -23,6 +23,11 @@ its terminals.
+ `app.check_updates` checks for newer releases. Settings reports "Up to date"
+ only after a successful check; on failure, check the connection and retry.
+ 
++For programs that cached the wrong input background, `settings.json` accepts
++`terminal_background_overrides`, an optional map of exact `#rrggbb` background
++colors to replacements. It repaints existing terminal backgrounds live without
++restarting programs. See the home folder's `AGENTS.md` for an example.
++
+ ## Show something when asked
+ 
+ New spaces and tabs are shown immediately: only create them when asked.
+diff --git a/src/settings.rs b/src/settings.rs
+index 10e7b33..f1b41f3 100644
+--- a/src/settings.rs
++++ b/src/settings.rs
+@@ -389,6 +389,9 @@ pub struct Person {
+     pub clipboard_write: bool,
+     /// Minimum terminal text contrast ratio; 1 leaves program colors unchanged.
+     pub minimum_contrast: f32,
++    /// Exact terminal background substitutions, for programs that cached the wrong theme.
++    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
++    pub terminal_background_overrides: BTreeMap<String, String>,
+     /// macOS Option sends Alt shortcuts, or follows the keyboard layout.
+     #[serde(skip_serializing_if = "OptionAsAlt::is_auto")]
+     pub option_as_alt: OptionAsAlt,
+@@ -447,6 +450,7 @@ impl Default for Person {
+             telemetry: true,
+             clipboard_write: true,
+             minimum_contrast: 1.0,
++            terminal_background_overrides: BTreeMap::new(),
+             option_as_alt: OptionAsAlt::Auto,
+             appearance: Appearance::System,
+             theme: None,
+@@ -481,6 +485,7 @@ pub struct Settings {
+     pub terminal_opacity: f32,
+     pub clipboard_write: bool,
+     pub minimum_contrast: f32,
++    pub terminal_background_overrides: BTreeMap<String, String>,
+     pub option_as_alt: OptionAsAlt,
+     pub sounds: Sounds,
+ }
+@@ -521,6 +526,7 @@ impl Default for Settings {
+             terminal_opacity: 1.0,
+             clipboard_write: true,
+             minimum_contrast: 1.0,
++            terminal_background_overrides: BTreeMap::new(),
+             option_as_alt: OptionAsAlt::Auto,
+             sounds: Sounds::default(),
+         }
+@@ -558,6 +564,7 @@ impl Settings {
+             sounds: person.sounds.clone(),
+             clipboard_write: person.clipboard_write,
+             minimum_contrast: person.minimum_contrast,
++            terminal_background_overrides: person.terminal_background_overrides.clone(),
+             option_as_alt: person.option_as_alt,
+         }
+     }
+@@ -606,6 +613,11 @@ impl Settings {
+         if !(1.0..=21.0).contains(&self.minimum_contrast) {
+             out.push(format!("minimum_contrast {} is outside 1..21", self.minimum_contrast));
+         }
++        for (from, to) in &self.terminal_background_overrides {
++            if [from, to].iter().any(|v| v.len() != 7 || !v.starts_with('#') || parse_hex(v).is_none()) {
++                out.push(format!("terminal_background_overrides: {from:?} -> {to:?} must use #rrggbb colors"));
++            }
++        }
+         if !(6.0..=72.0).contains(&self.font_size) {
+             out.push(format!("font_size {} is outside 6..72", self.font_size));
+         }
+@@ -876,6 +888,21 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn terminal_background_overrides_round_trip_and_validate() {
++        let default: Person = serde_json::from_str("{}").unwrap();
++        assert!(default.terminal_background_overrides.is_empty());
++        assert!(serde_json::to_value(default).unwrap().get("terminal_background_overrides").is_none());
++        for (from, to, valid) in [("#f4f4f4", "#323436", true), ("#f9f9f9", "#36383a", true), ("white", "#323436", false), ("#f4f4f4", "#323436ff", false)] {
++            let value = serde_json::json!({"terminal_background_overrides": {from: to}});
++            let person: Person = serde_json::from_value(value.clone()).unwrap();
++            let settings = Settings::compose(&person, &crate::layout::Look::default(), true);
++            assert_eq!(settings.terminal_background_overrides.get(from).unwrap(), to);
++            assert_eq!(settings.problems().is_empty(), valid);
++            assert_eq!(serde_json::to_value(person).unwrap()["terminal_background_overrides"], value["terminal_background_overrides"]);
++        }
++    }
++
+     #[test]
+     fn program_clipboard_writes_default_on_and_can_be_disabled() {
+         let default: Person = serde_json::from_str("{}").unwrap();
+diff --git a/src/vt.rs b/src/vt.rs
+index 817bad1..f99bc5b 100644
+--- a/src/vt.rs
++++ b/src/vt.rs
+@@ -58,6 +58,7 @@ pub struct Theme {
+     pub selection_bg: Rgb,
+     pub palette16: [Rgb; 16],
+     pub minimum_contrast: f32,
++    pub background_overrides: Vec<(Rgb, Rgb)>,
+ }
+ 
+ /// The terminal colors from settings.json's theme.
+@@ -69,7 +70,9 @@ pub fn theme() -> Theme {
+     for (i, c) in palette16.iter_mut().enumerate() {
+         *c = get(&format!("ansi{i}"));
+     }
+-    Theme { fg: get("terminal_foreground"), bg: get("background"), cursor: get("cursor"), selection_bg: get("selection"), palette16, minimum_contrast: crate::settings::get().minimum_contrast }
++    let settings = crate::settings::get();
++    let background_overrides = settings.terminal_background_overrides.iter().map(|(from, to)| (rgb(from), rgb(to))).collect();
++    Theme { fg: get("terminal_foreground"), bg: get("background"), cursor: get("cursor"), selection_bg: get("selection"), palette16, minimum_contrast: settings.minimum_contrast, background_overrides }
+ }
+ 
+ #[derive(Clone, Default, PartialEq)]
+@@ -1397,6 +1400,9 @@ impl Vt {
+                 bg = Some(fg);
+                 fg = new_fg;
+             }
++            if let Some(color) = bg {
++                bg = Some(self.theme.background_overrides.iter().find(|(from, _)| *from == color).map_or(color, |(_, to)| *to));
++            }
+             if selected {
+                 bg = Some(self.theme.selection_bg);
+             }
+@@ -1655,6 +1661,25 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn background_overrides_change_only_matching_backgrounds_and_reload_live() {
++        let mut vt = Vt::new(8, 4);
++        let original = theme();
++        vt.write(b"\x1b[38;2;211;211;211;48;2;244;244;244mA\x1b[48;2;249;249;249mB\x1b[48;2;255;255;255mC\x1b[0mD");
++        let before = vt.frame();
++        assert_eq!(before.rows[0][0].bg, Some(Rgb(244, 244, 244)));
++        let overrides = vec![(Rgb(244, 244, 244), Rgb(50, 52, 54)), (Rgb(249, 249, 249), Rgb(54, 56, 58))];
++        vt.set_theme(Theme { background_overrides: overrides, ..original.clone() });
++        let after = vt.frame();
++        assert_eq!(after.rows[0][0].bg, Some(Rgb(50, 52, 54)));
++        assert_eq!(after.rows[0][1].bg, Some(Rgb(54, 56, 58)));
++        assert_eq!(after.rows[0][2].bg, Some(Rgb(255, 255, 255)));
++        assert_eq!(after.rows[0][3].bg, before.rows[0][3].bg);
++        for i in 0..4 { assert_eq!(after.rows[0][i].fg, before.rows[0][i].fg); }
++        vt.set_theme(original);
++        assert!(vt.frame().rows[0] == before.rows[0]);
++    }
++
+     #[test]
+     fn graphics_keep_low_contrast_colors_in_frames() {
+         let mut vt = Vt::new(8, 2);

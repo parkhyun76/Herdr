@@ -1,24 +1,53 @@
 # Herdr_Upgrade
 
-Herdr 데스크톱 앱 개선 작업. Herdr의 인터페이스는 `~/.config/herdr-app/` 파일들이고
-(공식 안내: 그 폴더의 `AGENTS.md`), 이 저장소는 그중 직접 만든 mod의 원본을 관리한다.
+Herdr Windows 개인 개선판의 전체 앱 소스와 사용자 mod를 관리한다.
+상위 프로젝트는 [herdrdev/herdr-app](https://github.com/herdrdev/herdr-app)이며
+Apache-2.0 및 각 의존성의 라이선스·저작권을 유지한다.
+전체 native 소스는 `native/herdr-app/`, 사용자 UI는 `mods/`에 있다.
+[Windows 빌드·설치](docs/BUILD-WINDOWS.md) · [오류 기록·자동 개선](docs/DIAGNOSTICS.md)
 
 ## 구성
 
 | 경로 | 내용 |
 |---|---|
 | `mods/changes-branch/` | 우측 Changes 패널. 기본 `changes` mod를 복제해 **Working / vs main** 전환을 추가 |
-| `scripts/deploy-mods.ps1` | `mods/*`를 `~/.config/herdr-app/mods/`로 복사 (Herdr가 즉시 핫 리로드) |
+| `mods/spaces-foldable/` | 좌측 Spaces 목록. 워크트리를 메인 체크아웃 아래로 접고, git 저장소 공간 아바타 왼쪽에 **+ (새 워크트리)** 버튼 |
+| `mods/tabs-inline-add/`, `mods/files-utf8/` | 탭 바, Files 패널 복제본 |
+| `layouts/main-worktree-folding.json` | 위 mod들을 쓰는 레이아웃 |
+| `upstream/<버전>/` | 복제 당시 Herdr 기본 mod·레이아웃 원본. 업데이트 후 바뀐 부분을 병합할 때 기준 |
+| `scripts/deploy-mods.ps1` | `mods/*`, `layouts/*.json`을 `~/.config/herdr-app/`로 복사 (Herdr가 즉시 핫 리로드) |
+| `scripts/check-herdr.ps1` | Herdr가 이 저장소의 mod·레이아웃을 그대로 쓰는지 점검 (`-Fix`: 복구) |
 | `tests/` | `git.js` 테스트 (`node --test`) |
+| `native/herdr-app/` | 앱 전체 Rust/GPUI 소스, 기본 UI, 라이선스, 고정 Ghostty 서브모듈 |
+| `scripts/repair-herdr.cjs` | 오류별 격리 수정·검사·조건부 적용 작업자 |
 
 ## 작업 흐름
 
 1. 이 저장소의 `mods/` 아래를 수정한다. (`~/.config/herdr-app/mods/` 쪽은 배포본이라 직접 고치지 않는다)
-2. `node --test` 로 테스트한다.
+2. `node --test tests/*.test.cjs tests/*.test.mjs` 로 루트 검사만 실행한다.
 3. `pwsh scripts/deploy-mods.ps1` 로 배포한다.
 4. `herdr-app status` 의 `errors`가 비었는지, 화면에서 동작하는지 확인한다.
 
 정션(junction)으로 연결하면 Herdr가 파일 변경을 감지하지 못해 핫 리로드가 되지 않으므로 복사 방식을 쓴다.
+
+## Herdr 업데이트 뒤
+
+```powershell
+pwsh scripts/check-herdr.ps1        # 점검만
+pwsh scripts/check-herdr.ps1 -Fix   # 저장소 내용으로 다시 배포하고 레이아웃을 main-worktree-folding으로 되돌림
+```
+
+점검 항목: 배포된 mod·레이아웃이 저장소와 같은지, 사용 중인 레이아웃, `*.error` 파일과 `herdr-app status`의 errors,
+Herdr가 남긴 `-edited` / `.reset-` / `.old-` 파일, 그리고 복제 원본인 기본 mod(`spaces`, `tabs`, `files`, `changes`)가
+`upstream/<cloned_from 버전>/`과 달라졌는지.
+
+마지막 항목이 뜨면 Herdr가 기본 mod를 고친 것이다. `-Fix`로는 해결되지 않으므로, 바뀐 내용을 복제본에 병합한다
+(`git merge-file mods/<복제본>/main.js upstream/<옛 버전>/mods/<원본>/main.js ~/.config/herdr-app/mods/<원본>/main.js`).
+그다음 새 버전의 원본을 `upstream/<새 버전>/`에 저장하고, 복제본 `mod.json`의 `cloned_from.version`을 올린다.
+
+Herdr 안내(`AGENTS.md`)에 따르면 업데이트는 기본 mod·레이아웃만 덮어쓴다. 복제본(`cloned_from`이 있는 것)은 건드리지 않는다.
+기본 파일을 직접 고쳤다면 Herdr가 그 파일을 `<이름>-edited`로 옮기고 원래대로 되돌린다.
+그러니 기본 mod는 직접 고치지 않는다. 항상 `mod.clone`으로 복제한 뒤 이 저장소에서 관리한다.
 
 ## changes-branch
 
@@ -28,3 +57,39 @@ Herdr 데스크톱 앱 개선 작업. Herdr의 인터페이스는 `~/.config/her
 - 전환: 패널 버튼, 또는 `herdr-app do changes-branch.toggle` (`working` / `branch`).
   `keys.json`에 `"changes-branch:toggle"`을 연결하면 단축키로 쓸 수 있다.
 - 사용 레이아웃 `main-worktree-folding`의 `changes` 블록이 이 mod를 가리킨다.
+
+## Windows AI 대화 자동 복원
+
+사용자 native 빌드에 대화 연결 저장 기능을 추가했다. Claude Code·Codex의 정확한
+대화 ID를 워크스페이스·탭·분할 창 ID와 연결한다. 시작·전환 이벤트와 변경을 저장하고,
+5분마다 보완 점검하며 정상 종료 전에 마지막 상태를 저장한다. 대화 본문은 각 AI의
+기존 저장소에 두고 연결 정보만 `%LOCALAPPDATA%/Herdr/session-restore.json`에 저장한다.
+별도 앱 홈이나 core 세션은 충돌을 피하기 위해 접미사가 붙은 파일을 사용한다.
+
+- 앱만 다시 열거나 core 재시작 후 AI가 살아 있으면 기존 연결을 사용한다.
+- 실제 터미널 손실 후 core가 복구한 셸에 대해서만, 이전 대화를 새 터미널에서 재개해 원래 pane에 배정한다.
+- 직접 닫은 창·정상 종료한 AI·다른 창에서 이미 실행 중인 대화는 다시 시작하지 않는다.
+- 정확한 ID/대화 파일/폴더를 확인하지 못하면 최근 대화로 대체하지 않는다.
+- 복원 자체는 새 작업 지시를 보내지 않는다. 기존 모델·권한 옵션 중 확인된 항목만 유지한다.
+- 현재 대상은 로컬 Windows 터미널이다. 원격 기기의 복원 동작은 변경하지 않는다.
+
+`herdr-app status`의 `session_restore`에서 저장 건수·확인 대기 창·오류를 확인한다.
+앱을 닫은 상태에서 저장 파일의 `enabled`를 `false`로 바꾸면 자동 복원을 끌 수 있다.
+연결 저장에는 원자적 파일 교체·직전 정상 사본·단일 작성자 잠금을 사용한다.
+
+native 원본은 `native/herdr-app/`, 이전 유지보수 패치는 `patches/`에 있다.
+`scripts/install-session-restore.cjs`는 기존 설정을 백업하고 이 기능의 AI 훅만 추가하며,
+Codex가 제공한 정확한 훅 해시를 config API로 신뢰 등록한다. 기존 훅·권한 설정은 보존한다.
+앱 업데이트로 native 실행 파일이 교체되면 이 기능의 패치도 다시 반영해야 한다.
+
+## 오류 기록과 자동 개선
+
+클릭 명령 실패·스크립트/화면 오류·설정 오류·panic을 앱 홈 `diagnostics/`에
+상세 기록하고 반복 오류를 묶는다. 일시적인 화면 오류에는 제한된 재시도를 한다.
+`herdr-app status`의 `diagnostics`에서 기록·자동 수정 상태를 확인한다.
+
+`scripts/install-auto-repair.ps1`로 활성화하면 별도 Git 작업 폴더에서 Codex가
+수정안을 만들고, 경로 제한·기존 파일 확인·검사를 통과한 변경만 적용한다.
+하루 기본 3회·15분 대기 제한이 있으며 UI 변경은 핫 리로드, native 변경은
+앱 종료 후 백업과 해시 확인을 거쳐 설치한다. GitHub에는 자동 푸시하지 않는다.
+설정·로그·인증정보·대화 이력·실행 파일은 이 소스 저장소에 포함하지 않는다.

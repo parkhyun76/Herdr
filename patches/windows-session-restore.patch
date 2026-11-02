@@ -1,0 +1,1770 @@
+diff --git a/src/main.rs b/src/main.rs
+index d3348d4..bd011a8 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -23,6 +23,7 @@ mod mod_files;
+ mod process_cwd;
+ mod programs;
+ mod settings;
++mod session_restore;
+ mod setup;
+ mod sound;
+ mod spawn;
+diff --git a/src/window.rs b/src/window.rs
+index dcd4d89..9d9ff07 100644
+--- a/src/window.rs
++++ b/src/window.rs
+@@ -399,6 +399,9 @@ pub struct AppWindow {
+     watched: Watched,
+     /// Core's terminal records by address.
+     live: HashMap<String, Value>,
++    session_memory: crate::session_restore::Manager,
++    restoring_sessions: HashSet<String>,
++    restored_shells: Vec<(String, String, String, String, String)>,
+     listed_once: bool,
+     /// Live folders by address (from the shell process).
+     cwds: HashMap<String, String>,
+@@ -451,6 +454,7 @@ impl AppWindow {
+         mods::note_fonts(cx);
+         let seen = std::fs::read_to_string(file("seen.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+         let mut w = AppWindow {
++            session_memory: crate::session_restore::Manager::new(core.clone()),
+             core,
+             runtime,
+             chrome: default_layout("main"),
+@@ -486,6 +490,8 @@ impl AppWindow {
+             written_where: HashMap::new(),
+             watched: Watched::default(),
+             live: HashMap::new(),
++            restoring_sessions: HashSet::new(),
++            restored_shells: Vec::new(),
+             listed_once: false,
+             cwds: HashMap::new(),
+             folders_checked: HashMap::new(),
+@@ -1702,6 +1708,7 @@ impl AppWindow {
+     /// Finish the accepted edit and any newer projection before the window goes.
+     pub fn drain_documents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+         if self.draining { return; }
++        self.session_memory.finish(self.session_bindings());
+         self.save();
+         self.draining = true;
+         QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
+@@ -1903,6 +1910,7 @@ impl AppWindow {
+             self.tell_term(&t.view, &t.address, cx);
+         }
+         self.listed_once = true;
++        self.remember_sessions(window, cx);
+         if changed {
+             self.sync(window, cx);
+         } else if listed {
+@@ -1910,6 +1918,124 @@ impl AppWindow {
+         }
+     }
+ 
++    /// The worker observes exact AI identities; layout edits stay on the window thread.
++    fn remember_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
++        if !cfg!(windows) || self.draining || !self.listed_once { return; }
++        let Some(slot) = self.documents.get("").filter(|s| s.available) else { return };
++        let clean = slot.pending.is_none() && slot.document.as_ref() == Some(&crate::mirror::Document::capture(&self.model, None));
++        if clean && self.recover_session_connections(window,cx) { return; }
++        let bindings = self.session_bindings();
++        for notice in self.session_memory.update(bindings, clean) {
++            match notice {
++                crate::session_restore::Notice::Error(error) => {
++                    tracing::warn!("{error}");
++                    self.layout_notice("AI 대화 기억", &error, window, cx);
++                }
++                crate::session_restore::Notice::Restore(plan) => self.restore_session(plan, window, cx),
++            }
++        }
++        // Release only the recovered empty shells, and only after the replacement layout
++        // has reached the core. A failed layout write keeps both processes recoverable.
++        if clean && !self.restored_shells.is_empty() {
++            let pending = std::mem::take(&mut self.restored_shells);
++            let core = self.core.clone();
++            cx.background_executor().spawn(async move {
++                for (old, new, _pane, space, tab) in pending {
++                    let labels = serde_json::json!({"herdr.space":space,"herdr.tab":tab});
++                    if let Err(e) = core.call("terminal.label", json!({"terminal":new,"labels":labels})) {
++                        tracing::warn!("session restore label: {e:#}");
++                    }
++                    // The old terminal cannot be adopted again if kill is delayed.
++                    let _ = core.call("terminal.label", json!({"terminal":old,"labels":{"herdr.space":"","herdr.tab":""}}));
++                    if let Err(e) = core.call("terminal.keep", json!({"terminal":old,"keep":false})) {
++                        tracing::warn!("session restore shell keep: {e:#}"); continue;
++                    }
++                    if let Err(e) = core.call("terminal.kill", json!({"terminal":old})) { tracing::warn!("session restore shell cleanup: {e:#}"); }
++                }
++            }).detach();
++        }
++    }
++
++    /// A launch may finish just as the previous window exits. Core labels form a
++    /// journal: recover that exact connection instead of starting the AI twice.
++    fn recover_session_connections(&mut self, window:&mut Window,cx:&mut Context<Self>) -> bool {
++        let pending=self.live.iter().filter_map(|(address,record)| {
++            if self.model.pane_of(address).is_some() { return None; }
++            let labels=record.get("labels")?;
++            let pane=labels["herdr.restore.pane"].as_str()?;
++            let old=labels["herdr.restore.old"].as_str()?;
++            let sid=labels["herdr.restore.session"].as_str()?;
++            let space=labels["herdr.restore.space"].as_str()?;
++            let tab=labels["herdr.restore.tab"].as_str()?;
++            if self.restoring_sessions.contains(pane) || !crate::session_restore::valid_id(sid)
++                || self.model.address_of(pane).as_deref()!=Some(old)
++                || !matches!(record.pointer("/report/app").and_then(Value::as_str),Some("codex"|"claude-code")) {return None;}
++            Some((old.to_owned(),address.clone(),pane.to_owned(),space.to_owned(),tab.to_owned()))
++        }).collect::<Vec<_>>();
++        let mut changed=false;
++        for (old,new,pane,space,tab) in pending {
++            let Some(node)=self.model.tab_mut(&tab).and_then(|t|t.root.find_mut(&pane)) else {continue};
++            node.kind=Kind::Block {content:Content::Terminal {terminal:new.clone()}};
++            self.closing_terminals.insert(old.clone(),true);
++            self.restored_shells.push((old,new,pane,space,tab));
++            changed=true;
++        }
++        if changed {self.save();self.sync(window,cx);self.flush_documents(false,window,cx);}
++        changed
++    }
++
++    fn session_bindings(&self) -> Vec<crate::session_restore::Binding> {
++        let live = &self.live;
++        self.model.spaces.iter().filter(|s| s.machine.is_none()).flat_map(|s| {
++            s.tabs.iter().flat_map(move |t| t.root.terminals().into_iter().filter_map(move |n| {
++                let address = n.terminal()?;
++                Some(crate::session_restore::Binding { space:s.id.clone(), tab:t.id.clone(), pane:n.id.clone(),
++                    terminal:address.into(), pid:live.get(address).and_then(|r| r["pid"].as_u64()).unwrap_or(0) as u32 })
++            }))
++        }).collect()
++    }
++
++    fn restore_session(&mut self, plan: crate::session_restore::Plan, window: &mut Window, cx: &mut Context<Self>) {
++        if self.draining || self.model.address_of(&plan.binding.pane).as_deref() != Some(&plan.binding.terminal)
++            || !self.restoring_sessions.insert(plan.binding.pane.clone()) { return; }
++        let core = self.core.clone();
++        let generation = self.core_generation;
++        let asked = plan.clone();
++        cx.spawn_in(window, async move |this, cx| {
++            let result = cx.background_executor().spawn(async move { crate::session_restore::launch(&core, &asked) }).await;
++            let _ = this.update_in(cx, |this, window, cx| {
++                this.restoring_sessions.remove(&plan.binding.pane);
++                match result {
++                    Ok((address, pid)) => {
++                        let valid = !this.draining && this.core_generation == generation
++                            && this.model.address_of(&plan.binding.pane).as_deref() == Some(&plan.binding.terminal)
++                            && this.live.get(&plan.binding.terminal).and_then(|r| r["pid"].as_u64()) == Some(plan.binding.pid as u64);
++                        if !valid {
++                            this.session_memory.completed(&plan, None, Some("Pane changed during restore".into()));
++                            let core = this.core.clone();
++                            cx.background_executor().spawn(async move { let _ = core.call("terminal.keep",json!({"terminal":address,"keep":false})); let _=core.call("terminal.kill",json!({"terminal":address})); }).detach();
++                            return;
++                        }
++                        let Some(node) = this.model.tab_mut(&plan.binding.tab).and_then(|t| t.root.find_mut(&plan.binding.pane)) else { return };
++                        node.kind = Kind::Block { content:Content::Terminal { terminal:address.clone() } };
++                        this.born.borrow_mut().insert(address.clone(), Instant::now());
++                        this.closing_terminals.insert(plan.binding.terminal.clone(),true);
++                        this.session_memory.completed(&plan, Some((address.clone(),pid)), None);
++                        this.restored_shells.push((plan.binding.terminal.clone(),address.clone(),plan.binding.pane.clone(),plan.binding.space.clone(),plan.binding.tab.clone()));
++                        this.save(); this.sync(window,cx); this.flush_documents(false,window,cx);
++                        this.layout_notice("AI 대화 복원", "원래 탭에서 저장한 대화를 여는 중입니다.",window,cx);
++                    }
++                    Err(error) => {
++                        let message=format!("{error:#}");
++                        this.session_memory.completed(&plan,None,Some(message.clone()));
++                        tracing::warn!("AI conversation restore: {message}");
++                        this.layout_notice("AI 대화 복원 실패", &message,window,cx);
++                    }
++                }
++            });
++        }).detach();
++    }
++
+     /// Tells the person an agent needs them or finished: Herdr's sounds, and a
+     /// toast (drawn by the `toast` mod; click it to go there) unless they're
+     /// looking at that agent.
+@@ -3470,6 +3596,7 @@ impl AppWindow {
+                     None => self.copies.get(&o.slot).map(|c| c.inst.name.clone()),
+                 }).collect::<Vec<_>>(),
+                 "errors": errors,
++                "session_restore": crate::session_restore::status(),
+             });
+         }
+         json!({ "error": "expected { do }, { ls }, { commands } or { status }" })
+diff --git a/defaults/AGENTS.md b/defaults/AGENTS.md
+--- a/defaults/AGENTS.md
++++ b/defaults/AGENTS.md
+@@ -133,6 +133,21 @@ the highlighted line shows where it will land.
+   with the same address; its original command is never run again. Splits
+   and mod panes stay. An exited or killed terminal is closed, not restarted.
+   Focus, zoom, recent spaces, settled tabs and seen attention stay on this screen.
++- **Windows AI conversation memory (custom build):** Claude Code and Codex identity
++  hooks record exact conversation IDs; the window connects them to stable space,
++  tab and pane IDs. Changes are saved promptly, checked every five minutes and
++  flushed on normal quit. Transcripts stay in the AI's own storage. Metadata is
++  in `%LOCALAPPDATA%/Herdr/session-restore.json` (isolated app homes/core sessions
++  have separate suffixed files), with a `.bak` and an exclusive writer lock.
++  After a terminal's shell is actually lost and core recovers it, an active saved
++  conversation can be resumed into the same pane. A surviving AI, an intentional
++  exit/closed pane, an uncertain ID or an unavailable transcript is not relaunched.
++  A restore sends no new task. Only previously observed model/permission settings
++  are retained. Recovery creates a fresh terminal; pane/tab IDs and splits stay.
++  `herdr-app status` includes `session_restore` counts, unresolved panes and errors.
++  Set the metadata file's `enabled` to false while the app is closed to disable.
++  This extension handles local Windows terminals; remote machines keep core's
++  normal shell recovery. A custom native update must retain this extension.
+ - Every terminal is a core terminal. Herdr labels the ones it starts with
+   `herdr.space=<id>` and `herdr.tab=<id>`. **A terminal with those
+   labels shows up there**, even one you start yourself:
+diff --git a/src/session_restore.rs b/src/session_restore.rs
+new file mode 100644
+index 0000000..aa274b8
+--- /dev/null
++++ b/src/session_restore.rs
+@@ -0,0 +1,1303 @@
++//! Windows AI session bindings. Transcripts remain in each AI's own store.
++//! Observation runs off the UI thread; only the window may replace a pane.
++use anyhow::{Context as _, Result, bail};
++use serde::{Deserialize, Serialize};
++use std::{
++    collections::{BTreeMap, HashSet},
++    fs::{File, OpenOptions},
++    io::{BufRead, Read},
++    path::{Path, PathBuf},
++    sync::mpsc,
++    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
++};
++
++#[derive(Clone, Debug)]
++pub struct Binding {
++    pub space: String,
++    pub tab: String,
++    pub pane: String,
++    pub terminal: String,
++    pub pid: u32,
++}
++
++#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
++#[serde(default)]
++pub struct Entry {
++    pub space: String,
++    pub tab: String,
++    pub pane: String,
++    pub terminal: String,
++    pub root_pid: u32,
++    pub root_start: String,
++    pub agent: String,
++    pub session_id: String,
++    pub cwd: String,
++    pub transcript: String,
++    pub options: Vec<String>,
++    pub active: bool,
++    pub updated_ms: u64,
++    pub attempted_root: String,
++    pub error: Option<String>,
++    pub settling_until_ms: u64,
++}
++
++#[derive(Default, Serialize, Deserialize)]
++#[serde(default)]
++struct Store {
++    version: u32,
++    home: String,
++    enabled: bool,
++    checked_ms: u64,
++    entries: BTreeMap<String, Entry>,
++    unresolved: BTreeMap<String, String>,
++}
++
++#[derive(Clone, Debug)]
++pub struct Plan {
++    pub binding: Binding,
++    pub start: String,
++    pub entry: Entry,
++}
++
++pub enum Notice {
++    Restore(Plan),
++    Error(String),
++}
++enum Message {
++    Frame(Vec<Binding>, bool),
++    Result(String, String, Option<(String, u32)>, Option<String>),
++    Stop(mpsc::Sender<()>),
++}
++
++pub struct Manager {
++    tx: mpsc::Sender<Message>,
++    rx: mpsc::Receiver<Notice>,
++    last_frame: Option<Instant>,
++    stopped: bool,
++}
++
++pub fn root() -> PathBuf {
++    std::env::var_os("LOCALAPPDATA")
++        .map(PathBuf::from)
++        .unwrap_or_else(std::env::temp_dir)
++        .join("Herdr/session-restore")
++}
++
++pub fn state_path() -> PathBuf {
++    use sha2::{Digest, Sha256};
++    let home = crate::mods::app_dir();
++    let default = std::env::var_os("USERPROFILE")
++        .map(PathBuf::from)
++        .unwrap_or_default()
++        .join(".config/herdr-app");
++    let session = std::env::var("HC_SESSION").unwrap_or_else(|_| "default".into());
++    let name = if home == default && session == "default" {
++        "session-restore.json".into()
++    } else {
++        let digest = Sha256::digest(format!(
++            "{}:{session}",
++            home.to_string_lossy().to_lowercase()
++        ));
++        format!("session-restore-{}.json", &format!("{digest:x}")[..16])
++    };
++    root().parent().unwrap().join(name)
++}
++
++pub fn status() -> serde_json::Value {
++    let path = state_path();
++    match std::fs::read(&path)
++        .ok()
++        .and_then(|b| serde_json::from_slice::<Store>(&b).ok())
++    {
++        Some(s) => serde_json::json!({"file":path,"enabled":s.enabled,"tracked":s.entries.len(),
++            "active":s.entries.values().filter(|e|e.active).count(),"checked_ms":s.checked_ms,"unresolved":s.unresolved,
++            "issues":s.entries.values().filter_map(|e|e.error.as_ref().map(|error|serde_json::json!({"pane":e.pane,"error":error}))).collect::<Vec<_>>()}),
++        None => serde_json::json!({"file":path,"state":"starting_or_unavailable"}),
++    }
++}
++
++impl Manager {
++    pub fn new(core: std::sync::Arc<crate::hc::Core>) -> Self {
++        let (tx, input) = mpsc::channel();
++        let (output, rx) = mpsc::channel();
++        if cfg!(windows) {
++            std::thread::spawn(move || {
++                if let Err(e) = worker(input, &output, core) {
++                    let _ = output.send(Notice::Error(format!("AI session memory: {e:#}")));
++                }
++            });
++        }
++        Self {
++            tx,
++            rx,
++            last_frame: None,
++            stopped: false,
++        }
++    }
++
++    pub fn update(&mut self, bindings: Vec<Binding>, can_restore: bool) -> Vec<Notice> {
++        if self
++            .last_frame
++            .is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
++            && !self.stopped
++        {
++            self.last_frame = Some(Instant::now());
++            let _ = self.tx.send(Message::Frame(bindings, can_restore));
++        }
++        self.rx.try_iter().collect()
++    }
++
++    pub fn completed(&self, plan: &Plan, new: Option<(String, u32)>, error: Option<String>) {
++        let _ = self.tx.send(Message::Result(
++            plan.binding.pane.clone(),
++            plan.entry.session_id.clone(),
++            new,
++            error,
++        ));
++    }
++
++    pub fn stop(&mut self) {
++        if self.stopped {
++            return;
++        }
++        self.stopped = true;
++        if cfg!(windows) {
++            let (tx, rx) = mpsc::channel();
++            if self.tx.send(Message::Stop(tx)).is_ok()
++                && rx.recv_timeout(Duration::from_secs(10)).is_err()
++            {
++                tracing::warn!("AI session memory did not finish within the quit budget");
++            }
++        }
++    }
++
++    pub fn finish(&mut self, bindings: Vec<Binding>) {
++        #[cfg(windows)]
++        let shutting_down =
++            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(0x2000) != 0 };
++        #[cfg(not(windows))]
++        let shutting_down = false;
++        let _ = self.tx.send(Message::Frame(
++            if shutting_down { vec![] } else { bindings },
++            false,
++        ));
++        self.stop();
++    }
++}
++impl Drop for Manager {
++    fn drop(&mut self) {
++        self.stop();
++    }
++}
++
++fn now() -> u64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_millis() as u64
++}
++pub fn valid_id(id: &str) -> bool {
++    id.len() == 36
++        && id.bytes().enumerate().all(|(i, b)| {
++            if [8, 13, 18, 23].contains(&i) {
++                b == b'-'
++            } else {
++                b.is_ascii_hexdigit()
++            }
++        })
++}
++
++#[derive(Clone, Default, Deserialize)]
++#[serde(default)]
++struct ProcessRoot {
++    pid: u32,
++    start: String,
++    idle_shell: bool,
++    holder_pid: u32,
++}
++#[derive(Clone, Default, Deserialize)]
++#[serde(default)]
++struct Agent {
++    pid: u32,
++    start: String,
++    ancestors: Vec<u32>,
++    agent: String,
++    session_id: Option<String>,
++    cwd: Option<String>,
++    transcript: Option<String>,
++    options: Vec<String>,
++    days: Vec<String>,
++}
++#[derive(Default, Deserialize)]
++struct Scan {
++    roots: Vec<ProcessRoot>,
++    agents: Vec<Agent>,
++    #[serde(default)]
++    claims: Vec<Claim>,
++    #[serde(default)]
++    claude_projects: String,
++}
++#[derive(Default, Deserialize)]
++#[serde(default)]
++struct Claim {
++    agent: String,
++    session_id: String,
++    cwd: String,
++    transcript: String,
++    model: String,
++    updated_ms: u64,
++    ended: bool,
++    lineage: Vec<ProcessRoot>,
++}
++
++fn scan(bindings: &[Binding]) -> Result<Scan> {
++    #[cfg(test)]
++    let links = std::env::var_os("HERDR_RESTORE_TEST_LINKS")
++        .map(PathBuf::from)
++        .unwrap_or_else(|| root().join("links"));
++    #[cfg(not(test))]
++    let links = root().join("links");
++    let roots = bindings
++        .iter()
++        .map(|b| b.pid.to_string())
++        .collect::<Vec<_>>()
++        .join(",");
++    let mut child = crate::spawn::command("powershell.exe")
++        .args([
++            "-NoLogo",
++            "-NoProfile",
++            "-NonInteractive",
++            "-ExecutionPolicy",
++            "Bypass",
++            "-File",
++        ])
++        .arg(root().join("scan.ps1"))
++        .arg("-Roots")
++        .arg(roots)
++        .arg("-Links")
++        .arg(links)
++        .stdout(std::process::Stdio::piped())
++        .stderr(std::process::Stdio::piped())
++        .spawn()?;
++    let mut stdout = child.stdout.take().unwrap();
++    let mut stderr = child.stderr.take().unwrap();
++    let out = std::thread::spawn(move || {
++        let mut b = Vec::new();
++        stdout.read_to_end(&mut b).map(|_| b)
++    });
++    let err = std::thread::spawn(move || {
++        let mut b = String::new();
++        stderr.read_to_string(&mut b).map(|_| b)
++    });
++    let deadline = Instant::now() + Duration::from_secs(8);
++    let status = loop {
++        if let Some(status) = child.try_wait()? {
++            break status;
++        }
++        if Instant::now() >= deadline {
++            let _ = child.kill();
++            let _ = child.wait();
++            bail!("process observation timed out; no sessions were changed");
++        }
++        std::thread::sleep(Duration::from_millis(25));
++    };
++    let bytes = out
++        .join()
++        .map_err(|_| anyhow::anyhow!("process observation reader failed"))??;
++    let errors = err
++        .join()
++        .map_err(|_| anyhow::anyhow!("process observation error reader failed"))??;
++    if !status.success() {
++        bail!("process observation failed: {errors}");
++    }
++    let mut snapshot: Scan =
++        serde_json::from_slice(&bytes).context("invalid process observation")?;
++    enrich(&mut snapshot);
++    Ok(snapshot)
++}
++
++fn enrich(scan: &mut Scan) {
++    let projects = std::fs::read_dir(&scan.claude_projects)
++        .into_iter()
++        .flatten()
++        .filter_map(|e| e.ok().map(|e| e.path()))
++        .collect::<Vec<_>>();
++    for agent in &mut scan.agents {
++        let Some(sid) = agent.session_id.as_deref().filter(|id| valid_id(id)) else {
++            continue;
++        };
++        let existing = agent
++            .transcript
++            .as_deref()
++            .map(PathBuf::from)
++            .filter(|p| p.is_file());
++        let transcript = existing.or_else(|| {
++            if agent.agent == "claude" {
++                projects
++                    .iter()
++                    .map(|p| p.join(format!("{sid}.jsonl")))
++                    .find(|p| p.is_file())
++            } else {
++                agent
++                    .days
++                    .iter()
++                    .filter_map(|d| std::fs::read_dir(d).ok())
++                    .flatten()
++                    .filter_map(|e| e.ok().map(|e| e.path()))
++                    .find(|p| {
++                        p.file_name()
++                            .is_some_and(|n| n.to_string_lossy().ends_with(&format!("{sid}.jsonl")))
++                    })
++            }
++        });
++        if let Some(path) = transcript {
++            if agent.agent == "codex" {
++                let header = (|| -> Result<serde_json::Value> {
++                    let mut line = String::new();
++                    std::io::BufReader::new(File::open(&path)?.take(1024 * 1024))
++                        .read_line(&mut line)?;
++                    Ok(serde_json::from_str(&line)?)
++                })();
++                match header {
++                    Ok(v) if v["type"] == "session_meta" && v["payload"]["id"] == sid => {
++                        agent.cwd = v["payload"]["cwd"].as_str().map(str::to_owned);
++                    }
++                    _ => {
++                        agent.session_id = None;
++                        continue;
++                    }
++                }
++            }
++            agent.transcript = Some(path.to_string_lossy().into_owned());
++        }
++    }
++}
++
++fn load(path: &Path, home: &str) -> Result<Store> {
++    let backup = path.with_extension("json.bak");
++    let parse = |path: &Path| -> Result<Store> {
++        let store: Store = serde_json::from_slice(&std::fs::read(path)?)?;
++        if store.version != 1 || store.home != home {
++            bail!("unsupported session memory version or app home");
++        }
++        Ok(store)
++    };
++    if !path.exists() && !backup.exists() {
++        return Ok(Store {
++            version: 1,
++            home: home.into(),
++            enabled: true,
++            ..Default::default()
++        });
++    }
++    match parse(path) {
++        Ok(store) => Ok(store),
++        Err(first) => {
++            let store = parse(&backup).with_context(|| {
++                format!("session memory and backup cannot be loaded: {first:#}")
++            })?;
++            // Preserve the damaged file; never silently start with an empty mapping.
++            if path.exists() {
++                std::fs::rename(path, path.with_extension(format!("json.corrupt-{}", now())))?;
++            }
++            crate::persist::write_atomic(path, serde_json::to_vec_pretty(&store)?)?;
++            Ok(store)
++        }
++    }
++}
++
++fn save(path: &Path, store: &Store) -> Result<()> {
++    let bytes = serde_json::to_vec_pretty(store)?;
++    if let Ok(previous) = std::fs::read(path) {
++        // Only rotate a readable, compatible previous state into the backup.
++        let old: Store = serde_json::from_slice(&previous)?;
++        if old.version != 1 || old.home != store.home {
++            bail!("refusing to overwrite incompatible session memory");
++        }
++        crate::persist::write_atomic(&path.with_extension("json.bak"), previous)?;
++    }
++    crate::persist::write_atomic(path, bytes)?;
++    Ok(())
++}
++
++fn worker(
++    input: mpsc::Receiver<Message>,
++    output: &mpsc::Sender<Notice>,
++    core: std::sync::Arc<crate::hc::Core>,
++) -> Result<()> {
++    std::fs::create_dir_all(root().join("links"))?;
++    let path = state_path();
++    let _lock: File = OpenOptions::new()
++        .create(true)
++        .truncate(false)
++        .read(true)
++        .write(true)
++        .open(path.with_extension("json.lock"))?;
++    // A second window must not race the owner, including across Windows sessions.
++    _lock
++        .try_lock()
++        .context("another window already owns AI session memory")?;
++    crate::persist::write_atomic(
++        &root().join("scan.ps1"),
++        include_bytes!("session_restore/scan.ps1"),
++    )?;
++    crate::persist::write_atomic(
++        &root().join("hook.ps1"),
++        include_bytes!("session_restore/hook.ps1"),
++    )?;
++    let home = crate::mods::app_dir().to_string_lossy().into_owned();
++    let mut store = load(&path, &home)?;
++    if !store.enabled {
++        return Ok(());
++    }
++    if let Ok(list) = core.call_timeout(
++        "terminal.list",
++        serde_json::json!({}),
++        Duration::from_secs(2),
++    ) {
++        for entry in store
++            .entries
++            .values_mut()
++            .filter(|e| e.error.as_deref() == Some("Restore requested"))
++        {
++            let pending = list["terminals"].as_array().is_some_and(|records| {
++                records.iter().any(|r| {
++                    r["state"] == "live"
++                        && r.pointer("/labels/herdr.restore.pane")
++                            .and_then(serde_json::Value::as_str)
++                            == Some(&entry.pane)
++                        && r.pointer("/labels/herdr.restore.session")
++                            .and_then(serde_json::Value::as_str)
++                            == Some(&entry.session_id)
++                })
++            });
++            if !pending && list["terminals"].is_array() {
++                entry.attempted_root.clear();
++                entry.error = None;
++            }
++        }
++    }
++    let mut frames = Vec::new();
++    let mut can_restore = false;
++    let mut written = String::new();
++    let mut last_error = String::new();
++    let mut last_scan = Instant::now() - Duration::from_secs(300);
++    let mut last_trigger = String::new();
++    loop {
++        let message = match input.recv_timeout(Duration::from_secs(300)) {
++            Ok(message) => message,
++            Err(mpsc::RecvTimeoutError::Timeout) => Message::Frame(frames.clone(), can_restore),
++            Err(_) => break,
++        };
++        let mut messages = vec![message];
++        messages.extend(input.try_iter());
++        let mut stop = None;
++        for message in messages {
++            match message {
++                Message::Frame(bindings, ready) => {
++                    frames = bindings;
++                    can_restore = ready;
++                }
++                Message::Result(pane, sid, new, error) => {
++                    if let Some(entry) =
++                        store.entries.get_mut(&pane).filter(|e| e.session_id == sid)
++                    {
++                        entry.error = error;
++                        if let Some((address, pid)) = new {
++                            entry.terminal = address;
++                            entry.root_pid = pid;
++                            entry.root_start.clear();
++                            entry.settling_until_ms = now() + 30_000;
++                        }
++                    }
++                }
++                Message::Stop(ack) => {
++                    stop = Some(ack);
++                }
++            }
++        }
++        let stamp = |directory: PathBuf| {
++            std::fs::read_dir(directory)
++                .into_iter()
++                .flatten()
++                .filter_map(|f| f.ok()?.metadata().ok()?.modified().ok())
++                .max()
++                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
++                .map(|d| d.as_nanos())
++                .unwrap_or(0)
++        };
++        let trigger = format!(
++            "{frames:?}:{can_restore}:{}:{}",
++            stamp(root().join("links")),
++            stamp(std::env::temp_dir().join("CodexTerminalTitles"))
++        );
++        if !frames.is_empty()
++            && (stop.is_some()
++                || trigger != last_trigger
++                || last_scan.elapsed() >= Duration::from_secs(300))
++        {
++            last_scan = Instant::now();
++            last_trigger = trigger;
++            match scan(&frames) {
++                Ok(scan) => {
++                    last_error.clear();
++                    for plan in observe(
++                        &mut store,
++                        &frames,
++                        &scan,
++                        can_restore && stop.is_none(),
++                        now(),
++                    ) {
++                        // Durably claim before dispatch. A crash or second window never replays
++                        // an ambiguous launch; a new real process observation clears the claim.
++                        save(&path, &store)?;
++                        let _ = output.send(Notice::Restore(plan));
++                    }
++                }
++                Err(error) => {
++                    let error = format!("{error:#}");
++                    if error != last_error {
++                        let _ = output.send(Notice::Error(error.clone()));
++                        last_error = error;
++                    }
++                }
++            }
++        } else if frames.is_empty() && stop.is_none() && can_restore {
++            store.entries.clear();
++            store.unresolved.clear();
++        }
++        let body = serde_json::to_string(&(&store.entries, &store.unresolved))?;
++        if body != written || now().saturating_sub(store.checked_ms) >= 300_000 || stop.is_some() {
++            store.checked_ms = now();
++            save(&path, &store)?;
++            written = body;
++        }
++        if let Some(ack) = stop {
++            let _ = ack.send(());
++            break;
++        }
++    }
++    Ok(())
++}
++
++fn observe(
++    store: &mut Store,
++    bindings: &[Binding],
++    scan: &Scan,
++    ready: bool,
++    time: u64,
++) -> Vec<Plan> {
++    let panes = bindings
++        .iter()
++        .map(|b| b.pane.as_str())
++        .collect::<HashSet<_>>();
++    if ready {
++        store
++            .entries
++            .retain(|pane, _| panes.contains(pane.as_str()));
++        store
++            .unresolved
++            .retain(|pane, _| panes.contains(pane.as_str()));
++    }
++    let mut plans = Vec::new();
++    for b in bindings {
++        let Some(root) = scan
++            .roots
++            .iter()
++            .find(|r| r.pid == b.pid && !r.start.is_empty())
++        else {
++            continue;
++        };
++        let all = scan
++            .agents
++            .iter()
++            .filter(|a| a.ancestors.contains(&b.pid))
++            .collect::<Vec<_>>();
++        let agents = all
++            .iter()
++            .copied()
++            .filter(|a| {
++                !all.iter()
++                    .any(|p| p.pid != a.pid && a.ancestors.contains(&p.pid))
++            })
++            .collect::<Vec<_>>();
++        // More than one AI under a shell can be a sub-agent. Never infer ownership.
++        if agents.len() == 1 {
++            let a = agents[0];
++            if let (Some(sid), Some(cwd), Some(transcript)) = (&a.session_id, &a.cwd, &a.transcript)
++                && valid_id(sid)
++                && !cwd.is_empty()
++                && Path::new(transcript).is_file()
++            {
++                let same = store.entries.get(&b.pane).filter(|e| {
++                    e.session_id == *sid && e.root_start == root.start && e.root_pid == root.pid
++                });
++                let timestamp = same.map_or(time, |e| e.updated_ms);
++                store.entries.insert(
++                    b.pane.clone(),
++                    Entry {
++                        space: b.space.clone(),
++                        tab: b.tab.clone(),
++                        pane: b.pane.clone(),
++                        terminal: b.terminal.clone(),
++                        root_pid: root.pid,
++                        root_start: root.start.clone(),
++                        agent: a.agent.clone(),
++                        session_id: sid.clone(),
++                        cwd: cwd.clone(),
++                        transcript: transcript.clone(),
++                        options: a.options.clone(),
++                        active: true,
++                        updated_ms: timestamp,
++                        ..Default::default()
++                    },
++                );
++                store.unresolved.remove(&b.pane);
++            } else {
++                let reason = "The running AI has not reported an exact resumable conversation ID";
++                store.unresolved.insert(b.pane.clone(), reason.into());
++                if let Some(entry) = store.entries.get_mut(&b.pane) {
++                    entry.active = false;
++                    entry.error = Some(reason.into());
++                }
++            }
++            continue;
++        }
++        if !agents.is_empty() {
++            store.unresolved.insert(
++                b.pane.clone(),
++                "Multiple independent AIs share this terminal".into(),
++            );
++            if let Some(entry) = store.entries.get_mut(&b.pane) {
++                entry.active = false;
++                entry.updated_ms = time;
++                entry.error = Some(
++                    "Multiple independent AIs share this terminal; automatic restore is paused"
++                        .into(),
++                );
++            }
++            continue;
++        }
++        store.unresolved.remove(&b.pane);
++        let Some(entry) = store.entries.get_mut(&b.pane) else {
++            continue;
++        };
++        // Hooks keep the connection current even when the window is closed. Match
++        // the previous shell's PID AND birth time, never just a folder or a PID.
++        if let Some(claim) = scan
++            .claims
++            .iter()
++            .filter(|c| {
++                c.updated_ms > entry.updated_ms
++                    && c.lineage
++                        .iter()
++                        .any(|p| p.pid == entry.root_pid && p.start == entry.root_start)
++            })
++            .max_by_key(|c| c.updated_ms)
++            && valid_id(&claim.session_id)
++            && matches!(claim.agent.as_str(), "codex" | "claude")
++        {
++            if claim.session_id != entry.session_id {
++                entry.options.clear();
++                if !claim.model.is_empty()
++                    && !claim.model.starts_with('-')
++                    && !claim.model.chars().any(char::is_control)
++                {
++                    entry.options = vec!["--model".into(), claim.model.clone()];
++                }
++                entry.attempted_root.clear();
++            }
++            entry.agent = claim.agent.clone();
++            entry.session_id = claim.session_id.clone();
++            entry.cwd = claim.cwd.clone();
++            entry.transcript = claim.transcript.clone();
++            entry.updated_ms = claim.updated_ms;
++            entry.active = !claim.ended;
++        }
++        if scan.claims.iter().any(|claim| {
++            claim.ended
++                && claim.agent == entry.agent
++                && claim.session_id == entry.session_id
++                && claim.updated_ms >= entry.updated_ms
++        }) {
++            entry.active = false;
++            continue;
++        }
++        // A different terminal manually assigned to this pane is not recovery.
++        if b.terminal != entry.terminal {
++            entry.active = false;
++            continue;
++        }
++        if time < entry.settling_until_ms {
++            continue;
++        }
++        if entry.root_start.is_empty() {
++            entry.root_start = root.start.clone();
++        }
++        if root.pid == entry.root_pid && root.start == entry.root_start {
++            // The shell survived and its AI exited normally: do not resurrect it.
++            entry.active = false;
++            if entry.settling_until_ms != 0 {
++                entry.error =
++                    Some("The resumed AI did not become ready; check its terminal".into());
++            }
++            continue;
++        }
++        let key = format!("{}:{}", root.pid, root.start);
++        if !ready || !entry.active || !root.idle_shell || entry.attempted_root == key {
++            continue;
++        }
++        entry.attempted_root = key;
++        if scan
++            .agents
++            .iter()
++            .any(|a| a.session_id.as_deref() == Some(&entry.session_id))
++        {
++            entry.error = Some("This conversation is already running in another terminal".into());
++            continue;
++        }
++        if let Err(error) = validate(entry) {
++            entry.error = Some(error.to_string());
++            continue;
++        }
++        entry.error = Some("Restore requested".into());
++        plans.push(Plan {
++            binding: b.clone(),
++            start: root.start.clone(),
++            entry: entry.clone(),
++        });
++    }
++    plans
++}
++
++pub fn validate(entry: &Entry) -> Result<()> {
++    if !valid_id(&entry.session_id) || !matches!(entry.agent.as_str(), "codex" | "claude") {
++        bail!("Missing or invalid conversation ID");
++    }
++    if !Path::new(&entry.cwd).is_dir() {
++        bail!("Conversation folder is unavailable: {}", entry.cwd);
++    }
++    let path = Path::new(&entry.transcript);
++    if !path.is_file()
++        || !path.file_name().is_some_and(|n| {
++            n.to_string_lossy()
++                .ends_with(&format!("{}.jsonl", entry.session_id))
++        })
++    {
++        bail!("The saved conversation file is unavailable");
++    }
++    // File contents are never executed. Only a small whitelist of CLI options can persist.
++    let _ = resume_argv(entry)?;
++    Ok(())
++}
++
++pub fn resume_argv(entry: &Entry) -> Result<Vec<String>> {
++    if !valid_id(&entry.session_id) {
++        bail!("Invalid conversation ID");
++    }
++    let mut argv = vec![entry.agent.clone()];
++    if entry.agent == "codex" {
++        argv.push("--no-daemon".into());
++    }
++    let mut options = entry.options.iter();
++    while let Some(option) = options.next() {
++        match option.as_str() {
++            "--model" | "-m" | "--effort" | "--permission-mode" | "--sandbox" | "-s"
++            | "--ask-for-approval" | "-a" => {
++                let value = options.next().context("Missing launch option value")?;
++                if value.starts_with('-') || value.chars().any(char::is_control) {
++                    bail!("Invalid launch option value");
++                }
++                argv.extend([option.clone(), value.clone()]);
++            }
++            "-c" => {
++                let value = options.next().context("Missing reasoning setting")?;
++                if !["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
++                    .iter()
++                    .any(|v| value == &format!("model_reasoning_effort=\"{v}\""))
++                {
++                    bail!("Unsupported saved setting");
++                }
++                argv.extend([option.clone(), value.clone()]);
++            }
++            "--dangerously-skip-permissions" if entry.agent == "claude" => {
++                argv.push(option.clone())
++            }
++            "--dangerously-bypass-approvals-and-sandbox" if entry.agent == "codex" => {
++                argv.push(option.clone())
++            }
++            _ => bail!("Unsupported saved launch option"),
++        }
++    }
++    if entry.agent == "codex" {
++        argv.extend([
++            "resume".into(),
++            entry.session_id.clone(),
++            "-C".into(),
++            entry.cwd.clone(),
++        ]);
++    } else if entry.agent == "claude" {
++        argv.extend(["--resume".into(), entry.session_id.clone()]);
++    } else {
++        bail!("Unsupported AI program");
++    }
++    Ok(argv)
++}
++
++/// Recheck immediately before launching, off the UI thread. No user's shell receives input.
++pub fn launch(core: &crate::hc::Core, plan: &Plan) -> Result<(String, u32)> {
++    validate(&plan.entry)?;
++    let scan = scan(std::slice::from_ref(&plan.binding))?;
++    if !scan
++        .roots
++        .iter()
++        .any(|r| r.pid == plan.binding.pid && r.start == plan.start && r.idle_shell)
++        || scan.agents.iter().any(|a| {
++            a.session_id.as_deref() == Some(&plan.entry.session_id)
++                || a.ancestors.contains(&plan.binding.pid)
++        })
++    {
++        bail!("Terminal changed or the conversation is already running");
++    }
++    let record = core.call(
++        "terminal.get",
++        serde_json::json!({"terminal":plan.binding.terminal}),
++    )?;
++    if record["state"] != "live" || record["pid"].as_u64() != Some(plan.binding.pid as u64) {
++        bail!("Terminal changed before restore");
++    }
++    let argv = resume_argv(&plan.entry)?;
++    let shell = crate::window::shell();
++    use sha2::{Digest, Sha256};
++    let job = Sha256::digest(format!(
++        "{}:{}:{}",
++        plan.binding.pane, plan.binding.pid, plan.start
++    ));
++    let name = format!("hrestore-{}", &format!("{job:x}")[..16]);
++    let result=core.call("terminal.run",serde_json::json!({
++        "argv":vec![shell,"-NoExit".into(),"-Command".into(),crate::programs::powershell_line(&argv)],
++        "cwd":plan.entry.cwd,"keep":true,"name":name,
++        "env":{"TERM":"xterm-256color","COLORTERM":"truecolor","TERM_PROGRAM":"herdr"},
++        "labels":{"herdr.restore.pane":plan.binding.pane,"herdr.restore.session":plan.entry.session_id,
++            "herdr.restore.old":plan.binding.terminal,"herdr.restore.space":plan.binding.space,"herdr.restore.tab":plan.binding.tab}
++    }))?;
++    let address = result["address"]
++        .as_str()
++        .context("Restored terminal has no address")?
++        .to_owned();
++    let record = core
++        .call("terminal.get", serde_json::json!({"terminal":address}))
++        .context(
++            "Restored terminal was created; its journal labels preserve the pending connection",
++        )?;
++    Ok((address, record["pid"].as_u64().unwrap_or(0) as u32))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn binding() -> Binding {
++        Binding {
++            space: "s".into(),
++            tab: "t".into(),
++            pane: "p".into(),
++            terminal: "t1".into(),
++            pid: 20,
++        }
++    }
++    fn entry() -> Entry {
++        Entry {
++            space: "s".into(),
++            tab: "t".into(),
++            pane: "p".into(),
++            terminal: "t1".into(),
++            root_pid: 10,
++            root_start: "old".into(),
++            agent: "codex".into(),
++            session_id: "019a4055-2222-7333-8444-555555555555".into(),
++            active: true,
++            ..Default::default()
++        }
++    }
++    fn store(e: Entry) -> Store {
++        Store {
++            version: 1,
++            enabled: true,
++            entries: [("p".into(), e)].into(),
++            ..Default::default()
++        }
++    }
++    fn idle() -> Scan {
++        Scan {
++            roots: vec![ProcessRoot {
++                pid: 20,
++                start: "new".into(),
++                idle_shell: true,
++                holder_pid: 0,
++            }],
++            agents: vec![],
++            claims: vec![],
++            claude_projects: String::new(),
++        }
++    }
++    #[test]
++    fn exact_resume_has_no_task_and_rejects_unknown_options() {
++        let mut e = entry();
++        e.cwd = "D:/회의 자료/O'Brien".into();
++        e.options = vec!["-m".into(), "gpt-6.1-sol".into()];
++        let args = resume_argv(&e).unwrap();
++        assert_eq!(
++            args,
++            vec![
++                "codex",
++                "--no-daemon",
++                "-m",
++                "gpt-6.1-sol",
++                "resume",
++                &e.session_id,
++                "-C",
++                &e.cwd
++            ]
++        );
++        e.options = vec!["--config".into(), "malicious_command=true".into()];
++        assert!(resume_argv(&e).is_err());
++        assert!(!valid_id("../../other"));
++        assert!(valid_id(&e.session_id));
++    }
++    #[test]
++    fn live_ai_and_core_reconnect_never_restore() {
++        let mut s = store(entry());
++        let mut scan = idle();
++        scan.agents.push(Agent {
++            ancestors: vec![20],
++            ..Default::default()
++        });
++        assert!(observe(&mut s, &[binding()], &scan, true, 100).is_empty());
++        assert!(!s.entries["p"].active);
++        let mut e = entry();
++        e.root_pid = 20;
++        e.root_start = "new".into();
++        let mut s = store(e);
++        assert!(observe(&mut s, &[binding()], &idle(), true, 100).is_empty());
++        assert!(!s.entries["p"].active);
++    }
++    #[test]
++    fn closed_panes_manual_reassignment_and_busy_shells_are_excluded() {
++        let mut s = store(entry());
++        observe(&mut s, &[], &idle(), false, 100);
++        assert_eq!(s.entries.len(), 1);
++        observe(&mut s, &[], &idle(), true, 100);
++        assert!(s.entries.is_empty());
++        let mut b = binding();
++        b.terminal = "t2".into();
++        let mut s = store(entry());
++        observe(&mut s, &[b], &idle(), true, 100);
++        assert!(!s.entries["p"].active);
++        let mut scan = idle();
++        scan.roots[0].idle_shell = false;
++        let mut s = store(entry());
++        observe(&mut s, &[binding()], &scan, true, 100);
++        assert!(s.entries["p"].attempted_root.is_empty());
++    }
++    #[test]
++    fn missing_transcript_and_duplicate_conversation_are_never_guessed() {
++        let mut s = store(entry());
++        observe(&mut s, &[binding()], &idle(), true, 100);
++        assert!(s.entries["p"].error.is_some());
++        assert_eq!(s.entries["p"].attempted_root, "20:new");
++        let mut scan = idle();
++        scan.agents.push(Agent {
++            session_id: Some(entry().session_id),
++            ancestors: vec![99],
++            ..Default::default()
++        });
++        let mut s = store(entry());
++        observe(&mut s, &[binding()], &scan, true, 100);
++        assert!(
++            s.entries["p"]
++                .error
++                .as_deref()
++                .unwrap()
++                .contains("already running")
++        );
++    }
++    #[test]
++    fn corrupt_memory_uses_backup_and_preserves_damaged_file() {
++        let dir = std::env::temp_dir().join(format!(
++            "herdr-restore-test-{}-{}",
++            std::process::id(),
++            now()
++        ));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("state.json");
++        let mut s = store(entry());
++        s.home = "test".into();
++        save(&path, &s).unwrap();
++        save(&path, &s).unwrap();
++        std::fs::write(&path, b"broken").unwrap();
++        let recovered = load(&path, "test").unwrap();
++        assert_eq!(recovered.entries.len(), 1);
++        assert!(std::fs::read_dir(&dir).unwrap().any(|e| {
++            e.unwrap()
++                .file_name()
++                .to_string_lossy()
++                .contains("corrupt-")
++        }));
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++    #[test]
++    fn lost_root_restores_exact_binding_once_and_keeps_same_pid_reuse_distinct() {
++        let dir = std::env::temp_dir().join(format!(
++            "herdr-restore-positive-{}-{}",
++            std::process::id(),
++            now()
++        ));
++        std::fs::create_dir_all(&dir).unwrap();
++        let mut e = entry();
++        e.cwd = dir.to_string_lossy().into_owned();
++        let transcript = dir.join(format!("{}.jsonl", e.session_id));
++        std::fs::write(&transcript, "{}\n").unwrap();
++        e.transcript = transcript.to_string_lossy().into_owned();
++        let mut s = store(e.clone());
++        let plans = observe(&mut s, &[binding()], &idle(), true, 100);
++        assert_eq!(plans.len(), 1);
++        assert_eq!(plans[0].binding.pane, "p");
++        assert_eq!(plans[0].entry.session_id, e.session_id);
++        assert!(observe(&mut s, &[binding()], &idle(), true, 200).is_empty());
++        // The claim survives an app restart, even before a launch acknowledgement.
++        let mut restarted: Store =
++            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
++        assert!(observe(&mut restarted, &[binding()], &idle(), true, 300).is_empty());
++        e.root_pid = 20;
++        let mut reused = store(e.clone());
++        assert_eq!(
++            observe(&mut reused, &[binding()], &idle(), true, 100).len(),
++            1
++        );
++        let mut ended = idle();
++        ended.claims.push(Claim {
++            agent: "codex".into(),
++            session_id: e.session_id.clone(),
++            ended: true,
++            updated_ms: 100,
++            ..Default::default()
++        });
++        let mut resumed = e.clone();
++        resumed.updated_ms = 200;
++        let mut s = store(resumed);
++        assert_eq!(
++            observe(&mut s, &[binding()], &ended, true, 300).len(),
++            1,
++            "an old normal exit cannot cancel a later resumed conversation"
++        );
++        let mut s = store(e);
++        assert!(observe(&mut s, &[binding()], &ended, true, 100).is_empty());
++        assert!(!s.entries["p"].active);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    #[test]
++    fn hooks_capture_switches_while_window_is_closed_but_reject_reused_pids() {
++        let dir = std::env::temp_dir().join(format!(
++            "herdr-restore-claims-{}-{}",
++            std::process::id(),
++            now()
++        ));
++        std::fs::create_dir_all(&dir).unwrap();
++        let mut e = entry();
++        e.cwd = dir.to_string_lossy().into_owned();
++        let old_file = dir.join(format!("{}.jsonl", e.session_id));
++        std::fs::write(&old_file, "{}\n").unwrap();
++        e.transcript = old_file.to_string_lossy().into_owned();
++        let sid = "019a4055-2222-7333-8444-666666666666";
++        let new_file = dir.join(format!("{sid}.jsonl"));
++        std::fs::write(&new_file, "{}\n").unwrap();
++        let mut scan = idle();
++        scan.claims.push(Claim {
++            agent: "codex".into(),
++            session_id: sid.into(),
++            cwd: e.cwd.clone(),
++            transcript: new_file.to_string_lossy().into_owned(),
++            updated_ms: 50,
++            lineage: vec![ProcessRoot {
++                pid: 10,
++                start: "old".into(),
++                ..Default::default()
++            }],
++            ..Default::default()
++        });
++        let mut s = store(e.clone());
++        let plans = observe(&mut s, &[binding()], &scan, true, 100);
++        assert_eq!(plans[0].entry.session_id, sid);
++        scan.claims[0].lineage[0].start = "different-birth".into();
++        let mut s = store(e.clone());
++        let plans = observe(&mut s, &[binding()], &scan, true, 100);
++        assert_eq!(plans[0].entry.session_id, e.session_id);
++        scan.claims[0].lineage[0].start = "old".into();
++        scan.claims[0].ended = true;
++        let mut s = store(e);
++        assert!(observe(&mut s, &[binding()], &scan, true, 100).is_empty());
++        assert!(!s.entries["p"].active);
++        std::fs::remove_dir_all(dir).unwrap();
++    }
++
++    /// Run separately with a scratch LOCALAPPDATA, HERDR_APP_HOME and HC_SESSION.
++    /// Seeds one harmless reply in a real Codex TUI, then resumes without a new prompt.
++    /// Never touches the user's core or asks an AI to use tools.
++    #[test]
++    #[ignore = "requires an isolated Windows core and installed Codex"]
++    fn isolated_windows_loss_and_resume() {
++        assert!(
++            std::env::var("HC_SESSION")
++                .unwrap_or_default()
++                .starts_with("herdr-restore-test-")
++        );
++        assert!(
++            std::env::var("LOCALAPPDATA")
++                .unwrap()
++                .contains("herdr-restore-test-")
++        );
++        std::fs::create_dir_all(root().join("links")).unwrap();
++        crate::persist::write_atomic(
++            &root().join("scan.ps1"),
++            include_bytes!("session_restore/scan.ps1"),
++        )
++        .unwrap();
++        let core = crate::hc::Core::connect().unwrap();
++        let cwd = std::env::var("HERDR_RESTORE_TEST_CWD").expect("set an already trusted test cwd");
++        let mut cmd = vec![
++            "codex".into(),
++            "--no-daemon".into(),
++            "--no-alt-screen".into(),
++        ];
++        let seed = std::env::var("HERDR_RESTORE_TEST_SESSION_ID").ok();
++        if let Some(sid) = &seed {
++            assert!(valid_id(sid));
++            cmd.extend(["resume".into(), sid.clone(), "-C".into(), cwd.clone()]);
++        }
++        let reused = std::env::var("HERDR_RESTORE_TEST_TERMINAL").ok();
++        let address = if let Some(address) = &reused {
++            address.clone()
++        } else {
++            core.run(
++                vec![
++                    crate::window::shell(),
++                    "-NoExit".into(),
++                    "-Command".into(),
++                    crate::programs::powershell_line(&cmd),
++                ],
++                Some(cwd),
++                serde_json::json!({}),
++                None,
++            )
++            .unwrap()
++        };
++        let get = || {
++            core.call("terminal.get", serde_json::json!({"terminal":address}))
++                .unwrap()
++        };
++        let original_pid = get()["pid"].as_u64().unwrap() as u32;
++        let mut b = Binding {
++            terminal: address.clone(),
++            pid: original_pid,
++            ..binding()
++        };
++        let deadline = Instant::now() + Duration::from_secs(45);
++        let mut store = Store::default();
++        let mut sent = reused.is_some() || seed.is_some();
++        loop {
++            let snapshot = scan(std::slice::from_ref(&b)).unwrap();
++            observe(&mut store, std::slice::from_ref(&b), &snapshot, true, now());
++            if store.entries.contains_key(&b.pane) {
++                break;
++            }
++            if !sent
++                && get()
++                    .pointer("/status/app")
++                    .and_then(serde_json::Value::as_str)
++                    == Some("codex")
++            {
++                core.call("terminal.send",serde_json::json!({"terminal":address,
++                    "text":"Reply exactly HERDR_RESTORE_TEST_OK. Do not use tools, edit files, or run commands. This is an isolated conversation resume test.","wait":false})).unwrap();
++                sent = true;
++            }
++            if Instant::now() > deadline {
++                panic!("empty Codex TUI did not report a resumable session; terminal {address}");
++            }
++            std::thread::sleep(Duration::from_millis(500));
++        }
++        let original = store.entries[&b.pane].clone();
++        core.call(
++            "terminal.wait",
++            serde_json::json!({"terminal":address,"timeout":30}),
++        )
++        .unwrap();
++        println!("captured exact Codex ID and transcript of the isolated test conversation");
++        // Terminate only this isolated core's holder. TerminateProcess on just a
++        // shell is an ordinary exit on Windows, and correctly does not recover.
++        let before_loss = scan(std::slice::from_ref(&b)).unwrap();
++        let holder = before_loss
++            .roots
++            .iter()
++            .find(|r| r.pid == original_pid)
++            .unwrap()
++            .holder_pid;
++        assert_ne!(holder, 0);
++        assert!(
++            crate::spawn::command("taskkill.exe")
++                .args(["/F", "/PID", &holder.to_string()])
++                .status()
++                .unwrap()
++                .success()
++        );
++        let deadline = Instant::now() + Duration::from_secs(35);
++        let plan = loop {
++            let record = get();
++            b.pid = record["pid"].as_u64().unwrap_or(0) as u32;
++            if b.pid != 0 && b.pid != original_pid {
++                let snapshot = scan(std::slice::from_ref(&b)).unwrap();
++                let mut plans =
++                    observe(&mut store, std::slice::from_ref(&b), &snapshot, true, now());
++                if let Some(plan) = plans.pop() {
++                    break plan;
++                }
++            }
++            assert!(
++                Instant::now() < deadline,
++                "core did not recover this test's lost shell"
++            );
++            std::thread::sleep(Duration::from_millis(500));
++        };
++        println!("core recovered a new shell at the same terminal address");
++        let (new, pid) = launch(&core, &plan).unwrap();
++        let mut restored = b.clone();
++        restored.terminal = new.clone();
++        restored.pid = pid;
++        let deadline = Instant::now() + Duration::from_secs(45);
++        loop {
++            let snapshot = scan(std::slice::from_ref(&restored)).unwrap();
++            if snapshot.agents.iter().any(|a| {
++                a.ancestors.contains(&pid) && a.session_id.as_deref() == Some(&original.session_id)
++            }) {
++                println!(
++                    "resumed the exact previous ID after real root loss; no duplicate and no prompt sent"
++                );
++                break;
++            }
++            assert!(
++                Instant::now() < deadline,
++                "Codex did not reopen the saved conversation"
++            );
++            std::thread::sleep(Duration::from_millis(500));
++        }
++        for terminal in [&new, &address] {
++            core.call(
++                "terminal.keep",
++                serde_json::json!({"terminal":terminal,"keep":false}),
++            )
++            .unwrap();
++            core.call("terminal.kill", serde_json::json!({"terminal":terminal}))
++                .unwrap();
++        }
++    }
++}
+diff --git a/src/session_restore/scan.ps1 b/src/session_restore/scan.ps1
+new file mode 100644
+index 0000000..d035d07
+--- /dev/null
++++ b/src/session_restore/scan.ps1
+@@ -0,0 +1,141 @@
++param([string]$Roots, [string]$Links)
++$ErrorActionPreference = 'Stop'
++[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
++Add-Type -TypeDefinition @'
++using System;
++using System.Runtime.InteropServices;
++public static class HerdrRestoreArgs {
++    [DllImport("shell32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
++    static extern IntPtr CommandLineToArgvW(string text, out int count);
++    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr value);
++    public static string[] Split(string text) {
++        int count; IntPtr pointer=CommandLineToArgvW(text,out count);
++        if(pointer==IntPtr.Zero) throw new InvalidOperationException("Cannot read process arguments");
++        try {
++            var result=new string[count];
++            for(int i=0;i<count;i++) result[i]=Marshal.PtrToStringUni(Marshal.ReadIntPtr(pointer,i*IntPtr.Size));
++            return result;
++        } finally { LocalFree(pointer); }
++    }
++}
++'@
++$processes = @(Get-CimInstance Win32_Process)
++$byId = @{}
++foreach ($process in $processes) { $byId[[int]$process.ProcessId] = $process }
++function Stamp($process) { $process.CreationDate.ToUniversalTime().Ticks.ToString() }
++function Ancestors($process) {
++    $result = @()
++    $seen = @{}
++    while ($process -and -not $seen.ContainsKey([int]$process.ProcessId)) {
++        $seen[[int]$process.ProcessId] = $true
++        $result += [int]$process.ProcessId
++        $parent = $byId[[int]$process.ParentProcessId]
++        if ($parent -and $parent.CreationDate -gt $process.CreationDate) { break }
++        $process = $parent
++    }
++    return $result
++}
++$claims = @()
++if (Test-Path -LiteralPath $Links) {
++    foreach ($file in Get-ChildItem -LiteralPath $Links -Filter '*.json' -File) {
++        try { $claims += Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
++    }
++}
++$agents = @()
++$claudeRoot = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $env:USERPROFILE '.claude' }
++$codexRoot = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
++foreach ($process in $processes) {
++    $agent = switch ($process.Name.ToLowerInvariant()) { 'codex.exe' { 'codex' }; 'claude.exe' { 'claude' }; default { $null } }
++    if (-not $agent) { continue }
++    $command = $process.CommandLine
++    if (-not $command) { continue }
++    $arguments = [HerdrRestoreArgs]::Split($command)
++    if ($arguments.Count -gt 1 -and $arguments[1] -in @('app-server', 'exec-server', 'exec', 'review', 'mcp-server')) { continue }
++    if ($agent -eq 'claude' -and ($arguments -contains '--print' -or $arguments -contains '-p')) { continue }
++    $ancestors = @(Ancestors $process)
++    $stamp = Stamp $process
++    $sid = $null; $cwd = $null; $transcript = $null; $titlePath = $null
++    if ($agent -eq 'claude') {
++        $sessionFile = Join-Path $claudeRoot ('sessions/' + $process.ProcessId + '.json')
++        if (Test-Path -LiteralPath $sessionFile) {
++            try {
++                $session = Get-Content -LiteralPath $sessionFile -Raw -Encoding UTF8 | ConvertFrom-Json
++                if ($session.pid -eq $process.ProcessId -and $session.kind -eq 'interactive' -and
++                    [Math]::Abs([long]$session.procStart - $process.CreationDate.ToFileTimeUtc()) -lt 10000) {
++                    $sid = $session.sessionId; $cwd = $session.cwd
++                }
++            } catch {}
++        }
++    } else {
++        # The title launcher gives each TUI a unique state file; never select by cwd.
++        if ($command -match '(?i)CODEX_TITLE_FILE=\\?"?([^"\r\n]*?CodexTerminalTitles[/\\][0-9a-f]{32}\.json)') {
++            $titlePath = $Matches[1].Replace('\\"', '').Trim('"')
++            if (Test-Path -LiteralPath $titlePath) {
++                try { $sid = (Get-Content -LiteralPath $titlePath -Raw -Encoding UTF8 | ConvertFrom-Json).thread } catch {}
++            }
++        }
++        if (-not $sid) {
++            # A resumed TUI can display history before its next turn/start hook.
++            # Its explicit UUID is authoritative until a later hook reports a switch.
++            for ($i = 1; $i + 1 -lt $arguments.Count; $i++) {
++                if ($arguments[$i] -eq 'resume' -and $arguments[$i + 1] -match '^[0-9a-fA-F-]{36}$') { $sid = $arguments[$i + 1]; break }
++            }
++        }
++    }
++    $matching = @($claims | Where-Object {
++        $_.agent -eq $agent -and [int]$_.pid -eq $process.ProcessId -and $_.start -eq $stamp
++    } | Sort-Object updated_ms -Descending)
++    if ($matching.Count -gt 0) {
++        $claim = $matching[0]
++        # A start hook is authoritative across /new and /resume in the same TUI.
++        $sid = $claim.session_id; $cwd = $claim.cwd; $transcript = $claim.transcript
++    }
++    if ($sid -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { $sid = $null }
++    $days = @()
++    if ($sid -and $agent -eq 'codex') {
++            # UUIDv7 contains the creation time. Search its day, then adjacent UTC days.
++            try {
++                $hex = $sid.Replace('-', '').Substring(0, 12)
++                $day = [DateTimeOffset]::FromUnixTimeMilliseconds([Convert]::ToInt64($hex, 16)).UtcDateTime
++                foreach ($offset in @(0, -1, 1)) {
++                    $days += Join-Path $codexRoot ('sessions/' + $day.AddDays($offset).ToString('yyyy/MM/dd', [Globalization.CultureInfo]::InvariantCulture))
++                }
++            } catch {}
++    }
++    # Only recognized launch settings are retained, never the original task/prompt.
++    $options = @()
++    $resumeId = $false
++    for ($index = 1; $index -lt $arguments.Count; $index++) {
++        $flag = $arguments[$index]
++        if ($flag -eq 'resume') { $resumeId = $true; continue }
++        if ($flag -in @('--resume', '-r')) { $index++; continue }
++        if ($flag -in @('--model', '-m', '--effort', '--permission-mode', '--sandbox', '-s', '--ask-for-approval', '-a')) {
++            if ($index + 1 -lt $arguments.Count) { $options += $flag; $options += $arguments[++$index] }
++        } elseif ($flag -in @('--dangerously-skip-permissions', '--dangerously-bypass-approvals-and-sandbox')) { $options += $flag }
++        elseif ($flag -in @('-c', '--config')) {
++            $index++
++            if ($index -lt $arguments.Count -and $arguments[$index] -match '^model_reasoning_effort="?([a-z]+)"?$') {
++                $options += '-c'; $options += ('model_reasoning_effort="' + $Matches[1] + '"')
++            }
++        } elseif ($flag -in @('-C', '--cd', '--profile', '--add-dir', '--session-id', '--name', '-n')) { $index++ }
++        elseif (-not $flag.StartsWith('-')) {
++            if ($resumeId) { $resumeId = $false; continue }
++            break # The first task/prompt is opaque; never interpret options inside it.
++        }
++    }
++    $agents += @{ pid = [int]$process.ProcessId; start = $stamp; ancestors = $ancestors; agent = $agent;
++        session_id = $sid; cwd = $cwd; transcript = $transcript; options = $options; days = $days }
++}
++$rootsOut = @()
++foreach ($rootText in $Roots.Split(',')) {
++    $rootId = 0
++    if (-not [int]::TryParse($rootText, [ref]$rootId)) { continue }
++    $root = $byId[$rootId]
++    if (-not $root) { continue }
++    $children = @($processes | Where-Object { $_.ParentProcessId -eq $rootId -and $_.CreationDate -ge $root.CreationDate })
++    $holder = $byId[[int]$root.ParentProcessId]
++    $holderId = if ($holder -and $holder.Name -in @('herdr-core.exe', 'hc.exe') -and $holder.CommandLine -match '\shold\s') { [int]$holder.ProcessId } else { 0 }
++    $rootsOut += @{ pid = $rootId; start = (Stamp $root); holder_pid = $holderId;
++        idle_shell = ($root.Name -in @('pwsh.exe', 'powershell.exe', 'cmd.exe') -and $children.Count -eq 0) }
++}
++@{ roots = $rootsOut; agents = $agents; claude_projects = (Join-Path $claudeRoot 'projects'); claims = $claims } | ConvertTo-Json -Depth 7 -Compress
+diff --git a/src/session_restore/hook.ps1 b/src/session_restore/hook.ps1
+new file mode 100644
+index 0000000..01b860e
+--- /dev/null
++++ b/src/session_restore/hook.ps1
+@@ -0,0 +1,91 @@
++param([ValidateSet('codex', 'claude')][string]$Agent)
++$ErrorActionPreference = 'Stop'
++$lease = $null
++try {
++    $root = Join-Path $env:LOCALAPPDATA 'Herdr/session-restore/links'
++    $eventTime = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
++        $inputText = [Console]::In.ReadToEnd()
++        if ($inputText.Length -gt 1048576) { throw 'Session hook payload is too large' }
++        $payload = $inputText | ConvertFrom-Json
++        if ($payload.agent_id -or $payload.agent_type -eq 'subagent') { exit 0 }
++        $sid = $payload.session_id
++        if ($sid -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { exit 0 }
++        $eventName = $payload.hook_event_name
++        if ($eventName -notin @('SessionStart', 'SessionEnd', 'UserPromptSubmit', 'Stop')) { exit 0 }
++        $path = Join-Path $root ($Agent + '-' + $sid + '.json')
++        $data = $null
++        if ($eventName -in @('UserPromptSubmit','Stop') -and $env:HC_TERMINAL_ID -and (Test-Path -LiteralPath $path)) {
++            $previous = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
++            if ($previous.terminal_id -eq $env:HC_TERMINAL_ID -and -not $previous.ended) {
++                try {
++                    $owner = Get-Process -Id ([int]$previous.pid) -ErrorAction Stop
++                    if ([Math]::Abs($owner.StartTime.ToUniversalTime().Ticks - [long]$previous.start) -lt 10000) {
++                        $data = $previous
++                        $data.cwd = [string]$payload.cwd
++                        $data.transcript = [string]$payload.transcript_path
++                        $data.model = [string]$payload.model
++                        $data.updated_ms = $eventTime
++                    }
++                } catch { $data = $null }
++            }
++        }
++        if ($eventName -eq 'SessionEnd') {
++            # Windows shutdown is loss, not an intentional close of a conversation.
++            Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class HerdrSessionShutdown { [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index); }'
++            if ([HerdrSessionShutdown]::GetSystemMetrics(0x2000) -ne 0) { exit 0 }
++            if (Test-Path -LiteralPath $path) {
++                $data = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
++                $data.ended = $true
++                $data.updated_ms = $eventTime
++            }
++        }
++        if (-not $data) {
++        # Locate the actual TUI, never a daemon's unrelated sibling by folder.
++        $all = @(Get-CimInstance Win32_Process)
++        $byId = @{}
++        foreach ($process in $all) { $byId[[int]$process.ProcessId] = $process }
++        $current = $byId[$PID]
++        $anchor = $null
++        $daemonPattern = '(?i)^(?:"[^"]+"|\S+)\s+(?:app-server|exec-server)(?:\s|$)'
++        for ($depth = 0; $depth -lt 12 -and $current; $depth++) {
++            if ($current.Name -eq ($Agent + '.exe') -and $current.CommandLine -notmatch $daemonPattern) { $anchor = $current; break }
++            $current = $byId[[int]$current.ParentProcessId]
++        }
++        $title = if ($Agent -eq 'codex') { $env:CODEX_TITLE_FILE } else { $null }
++        if (-not $anchor -and $title) {
++            $normalizedTitle = $title.Replace('\', '/')
++            $owners = @($all | Where-Object { $_.Name -eq 'codex.exe' -and $_.CommandLine -and $_.CommandLine.Replace('\', '/').Contains($normalizedTitle) })
++            if ($owners.Count -eq 1) { $anchor = $owners[0] }
++        }
++        if (-not $anchor) { exit 0 }
++        $lineage = @()
++        $current = $anchor
++        for ($depth = 0; $depth -lt 16 -and $current; $depth++) {
++            if ($depth -gt 0 -and $current.Name -in @('claude.exe', 'codex.exe') -and $current.CommandLine -notmatch $daemonPattern) { exit 0 }
++            $lineage += @{ pid = [int]$current.ProcessId; start = $current.CreationDate.ToUniversalTime().Ticks.ToString() }
++            $parent = $byId[[int]$current.ParentProcessId]
++            if ($parent -and $parent.CreationDate -gt $current.CreationDate) { break }
++            $current = $parent
++        }
++        $ended = $eventName -eq 'SessionEnd'
++        $data = [ordered]@{ agent = $Agent; session_id = $sid; cwd = [string]$payload.cwd;
++            transcript = [string]$payload.transcript_path; pid = $(if ($anchor) { [int]$anchor.ProcessId } else { 0 });
++            start = $(if ($anchor) { $anchor.CreationDate.ToUniversalTime().Ticks.ToString() } else { '' });
++            title_path = $title; terminal_id = [string]$env:HC_TERMINAL_ID; lineage = $lineage; model = [string]$payload.model; ended = $ended; updated_ms = $eventTime }
++    }
++    [void][IO.Directory]::CreateDirectory($root)
++    for ($attempt = 0; $attempt -lt 20 -and -not $lease; $attempt++) {
++        try { $lease = [IO.File]::Open($path + '.lock', [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
++        catch [IO.IOException] { Start-Sleep -Milliseconds 20 }
++    }
++    if (-not $lease) { throw 'Session metadata is busy' }
++    if (Test-Path -LiteralPath $path) {
++        $previous = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
++        if ([long]$previous.updated_ms -gt $eventTime) { exit 0 }
++    }
++    $temporary = $path + '.' + $PID + '.tmp'
++    [IO.File]::WriteAllText($temporary, ($data | ConvertTo-Json -Depth 5 -Compress), [Text.UTF8Encoding]::new($false))
++    if (Test-Path -LiteralPath $path) { [IO.File]::Replace($temporary, $path, [NullString]::Value) }
++    else { [IO.File]::Move($temporary, $path) }
++} catch { [Console]::Error.WriteLine('[Herdr session restore] ' + $_.Exception.Message) }
++finally { if ($lease) { $lease.Dispose() } }

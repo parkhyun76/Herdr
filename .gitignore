@@ -1,3 +1,19 @@
 # Written into every mod folder by the Herdr app on start (its own type files)
 mods/*/jsconfig.json
 mods/*/gpui-kit.d.ts
+
+# Build products and machine-local/private state
+**/target/
+**/dist/
+build-tools/
+.env
+.env.*
+!.env.example
+**/diagnostics/
+**/session-restore.json*
+**/session-restore/links/
+**/auto-repair.json
+*.log
+*.exe
+*.pdb
+AGENTS.local.md
