@@ -2,12 +2,13 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, InputState, Input } from "gpui-base";
-import { hc, run, theme, themes, fonts, updates, telemetry, settings, layouts, shared, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay } from "herdr";
+import { hc, run, theme, themes, fonts, updates, telemetry, settings, layouts, shared, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay, window } from "herdr";
 
 const I = (name) => `frame/settings/${name}.svg`;
 
 const SECTIONS = [
   { id: "look", title: "Look", icon: "palette" },
+  ...(window()?.platform === "macos" ? [{ id: "keyboard", title: "Keyboard", icon: "keyboard" }] : []),
   { id: "machines", title: "Machines", icon: "server" },
   { id: "alerts", title: "Alerts", icon: "bell" },
   { id: "updates", title: "Updates", icon: "refresh" },
@@ -507,6 +508,35 @@ export default class Settings extends View {
       .child(fontRow("ui_font", null, "Interface font", s.ui_font_family, DEFAULT_UI_FONT));
   }
 
+  keyboard(t) {
+    const choices = [
+      ["auto", "Automatic (Alt on US keyboards)"],
+      ["on", "Alt"],
+      ["off", "Types characters"],
+      ["left", "Left Option is Alt"],
+      ["right", "Right Option is Alt"],
+    ];
+    return v_flex()
+      .w_full()
+      .child(this.heading(t, "Option key"))
+      .child(div().pb(12).text_size(13).text_color(t.dim).child("Use Option for terminal shortcuts or to type accents and special characters."))
+      .children(choices.map(([value, label]) => {
+        const on = (this.person.option_as_alt ?? "auto") === value;
+        return h_flex()
+          .id(`st-option-${value}`)
+          .gap(10)
+          .px(12)
+          .py(10)
+          .rounded(7)
+          .items_center()
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_click((_e, cx) => this.change((p) => { p.option_as_alt = value; }, cx))
+          .child(div().text_color(on ? t.accent : t.muted).child(on ? "◉" : "○"))
+          .child(div().text_size(14).text_color(t.foreground).child(label));
+      }));
+  }
+
   // Machines -------------------------------------------------------------
 
   async loadMachines() {
@@ -687,7 +717,7 @@ export default class Settings extends View {
     const primary = (id, label, f) =>
       div().id(id).px(12).py(5).rounded(7).cursor_pointer().bg(t.accent).text_color(t.accent_foreground).text_size(13).font_semibold().hover((s) => s.opacity(0.9)).on_click(f).child(label);
     const app = !u.app.updates
-      ? ["A build from source: it updates with git, not here.", null]
+      ? [u.app.personal ? "Personal build: official app updates are disabled to preserve your custom features." : "A build from source: it updates with git, not here.", null]
       : u.app.ready
         ? [`${u.app.ready} is ready. Restart to switch now; it also switches when you quit.`, primary("st-app-update", "Restart to update", () => run("app.update"))]
         : [result, check("st-check-app")];
@@ -712,7 +742,7 @@ export default class Settings extends View {
       .child(div().h(18))
       .child(this.heading(t, "herdr-core"))
       .child(this.row(t, `herdr-core ${c.version ?? ""}`, core[0], core[1] ?? div()))
-      .child(div().pt(12).text_size(12.5).line_height("18px").text_color(t.dim).child("Herdr looks for both every hour and tells you in the corner. herdr-core runs your terminals, so they keep running through its updates."));
+      .child(div().pt(12).text_size(12.5).line_height("18px").text_color(t.dim).child(u.app.personal ? "Install a verified personal build to update this app. herdr-core updates remain available and keep your terminals running." : "Herdr looks for both every hour and tells you in the corner. herdr-core runs your terminals, so they keep running through its updates."));
   }
 
 
@@ -870,6 +900,8 @@ export default class Settings extends View {
                   .child(
                     this.section === "look"
                       ? this.look(t, cx)
+                      : this.section === "keyboard"
+                        ? this.keyboard(t)
                       : this.section === "machines"
                         ? this.machines(t)
                       : this.section === "alerts"

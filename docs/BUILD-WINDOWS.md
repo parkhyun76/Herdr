@@ -2,7 +2,9 @@
 
 This personal fork includes the complete Herdr app source and vendored Rust/GPUI
 libraries under `native/herdr-app`. It is based on `herdrdev/herdr-app` commit
-`e12fd31866f33cb613922d0b33ea506e6f23ce3c`, version 0.1.11, under Apache-2.0.
+`4aa3460749947e7771aa39a8a2cec58d46649926` (`v0.1.12`), under Apache-2.0.
+The personal package is `0.1.12-personal.1`; previous native clipboard,
+background, conversation memory and diagnostic changes are preserved.
 Ghostty is a public pinned submodule at
 `291fd050b9e9c293c8adb6a140742649b7e42d3a`; its own license applies.
 `herdr-core` is a separate runtime dependency and is not copied into this repo.
@@ -31,9 +33,13 @@ then reopen the GUI in your normal Windows desktop session. Closing the GUI
 leaves core/AI terminals running. Do not stop herdr-core to install the app.
 Deploy the custom interface with `./scripts/deploy-mods.ps1`.
 
-An official upstream executable update can replace these native fixes. Keep this
-source fork and rebuild/reinstall after merging a new upstream release. Personal
-mods and the custom layout have distinct names and can be re-deployed separately.
+Versions marked `-personal.*` disable official app executable checks and swaps,
+including pending updates on startup and explicit `app.update`. The Settings
+Updates page explains this protection. Core update checks remain available.
+Merge upstream changes into this fork, retain the personal version marker, then
+test, rebuild and install the verified personal executable. Installing an official
+binary manually still replaces the native personal features. Personal mods and
+the custom layout have distinct names and can be re-deployed separately.
 
 The source snapshot was built/tested on the original local build checkout with
 the same runtime source bytes to reuse its existing compilation cache. Build

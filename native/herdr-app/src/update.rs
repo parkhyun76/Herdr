@@ -117,6 +117,8 @@ pub fn set_core(version: Option<String>, managed: Option<String>) {
 }
 
 fn checks_app() -> Option<PathBuf> {
+    // Official executables omit this fork's session memory and other native fixes.
+    if env!("CARGO_PKG_VERSION").contains("-personal.") { return None; }
     root().filter(|_| option_env!("HERDR_APP_RELEASE").is_some() || std::env::var_os("HERDR_RELEASES_URL").is_some())
 }
 
@@ -128,7 +130,7 @@ fn checks_core() -> bool {
 /// For the settings screen: both programs, what's waiting, when we last looked.
 pub fn status() -> serde_json::Value {
     serde_json::json!({
-        "app": { "version": env!("CARGO_PKG_VERSION"), "ready": ready(), "updates": checks_app().is_some() },
+        "app": { "version": env!("CARGO_PKG_VERSION"), "ready": ready(), "updates": checks_app().is_some(), "personal": env!("CARGO_PKG_VERSION").contains("-personal.") },
         "notes": crate::update_notes::notes(ready().as_deref()),
         "core": core(),
         "checked": *CHECKED.lock().unwrap(),
@@ -437,7 +439,7 @@ fn staged_version(root: &Path) -> Option<String> {
 }
 
 fn startup_target<'a>(running: &str, staged: Option<&'a str>, relaunched: Option<&str>) -> Option<&'a str> {
-    if relaunched.is_some() {
+    if relaunched.is_some() || running.contains("-personal.") {
         return None;
     }
     staged.filter(|version| newer(version, running))
@@ -470,7 +472,7 @@ pub fn apply_on_startup() -> bool {
 /// Windows lets a running program's folder be renamed, not deleted: the old
 /// one goes on the next start (`after_update`).
 pub fn apply() -> bool {
-    let Some(root) = root() else { return false };
+    let Some(root) = checks_app() else { return false };
     let staged = staged_version(&root);
     if ready().as_deref() != staged.as_deref() || !staged.as_deref().is_some_and(|version| newer(version, env!("CARGO_PKG_VERSION"))) {
         return false;
@@ -650,6 +652,8 @@ mod tests {
 
     #[test]
     fn startup_applies_only_a_newer_version_and_never_relaunches_twice() {
+        assert_eq!(startup_target("0.1.12-personal.1", Some("0.1.13"), None), None);
+        assert_eq!(startup_target("0.1.12-personal.1", Some("0.1.12"), None), None);
         assert_eq!(startup_target("0.1.7", Some("0.1.8"), None), Some("0.1.8"));
         for staged in [None, Some("0.1.6"), Some("0.1.7")] {
             assert_eq!(startup_target("0.1.7", staged, None), None);

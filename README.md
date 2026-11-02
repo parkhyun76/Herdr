@@ -6,7 +6,8 @@ Apache-2.0 및 각 의존성의 라이선스·저작권을 유지한다.
 전체 native 소스는 `native/herdr-app/`, 사용자 UI는 `mods/`에 있다.
 [Windows 빌드·설치](docs/BUILD-WINDOWS.md) · [오류 기록·자동 개선](docs/DIAGNOSTICS.md)
 
-현재 Windows 실행 파일은 [개인 개선판 릴리스](https://github.com/parkhyun76/Herdr/releases/tag/windows-custom-20261102)에서 받는다.
+기존 0.1.11 Windows 실행 파일은 [개인 개선판 릴리스](https://github.com/parkhyun76/Herdr/releases/tag/windows-custom-20261102)에서 받는다.
+현재 소스는 공식 0.1.12를 합친 `0.1.12-personal.1`이며 빌드 방법은 위 안내를 따른다.
 공식 앱·core와 구분되는 개인 빌드이며 기존 core 설치가 필요하다.
 
 ## 구성
@@ -75,6 +76,17 @@ Windows의 기본 파일 아이콘을 쓴다. 원격 기기와 다른 OS는 기�
 설치는 `scripts/deploy-mods.ps1`에 포함되며 앱 재시작이 필요 없다.
 
 ## Windows AI 대화 자동 복원
+
+Files 왼쪽의 **대화 저장·복원** 버튼을 누르면 선택 창이 열린다.
+**지금 저장**은 모든 로컬 워크스페이스의 대화 연결을 즉시 관측·저장하고,
+**저장된 대화 복원**은 사라진 AI만 기존 탭에서 재개한다. 실행 중인 대화를
+중복 실행하거나 직접 닫은 탭을 다시 만들지 않는다. 처리 완료/문제는 화면
+알림으로 표시하며 자동 저장·복원도 계속 작동한다. 대화 본문을 따로 복사하는
+기능은 아니다. CLI는 `session.save`, `session.restore`, `session.status`다.
+
+`-personal.*` 개인 빌드는 공식 앱 자동 다운로드·교체를 차단해 본체 수정을
+보호한다. core 업데이트는 별도 유지한다. 앱 업데이트는 공식 변경을 합친
+검증된 개인 빌드를 설치하는 방식으로 진행한다.
 
 사용자 native 빌드에 대화 연결 저장 기능을 추가했다. Claude Code·Codex의 정확한
 대화 ID를 워크스페이스·탭·분할 창 ID와 연결한다. 시작·전환 이벤트와 변경을 저장하고,

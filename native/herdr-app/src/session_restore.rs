@@ -62,9 +62,14 @@ pub struct Plan {
 pub enum Notice {
     Restore(Plan),
     Error(String),
+    ManualFinished(ManualAction, Result<String, String>),
 }
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ManualAction { Save, Restore }
+
 enum Message {
     Frame(Vec<Binding>, bool),
+    Manual(ManualAction, Vec<Binding>, bool),
     Result(String, String, Option<(String, u32)>, Option<String>),
     Stop(mpsc::Sender<()>),
 }
@@ -74,6 +79,7 @@ pub struct Manager {
     rx: mpsc::Receiver<Notice>,
     last_frame: Option<Instant>,
     stopped: bool,
+    manual_pending: bool,
 }
 
 pub fn root() -> PathBuf {
@@ -132,6 +138,7 @@ impl Manager {
             rx,
             last_frame: None,
             stopped: false,
+            manual_pending: false,
         }
     }
 
@@ -144,7 +151,18 @@ impl Manager {
             self.last_frame = Some(Instant::now());
             let _ = self.tx.send(Message::Frame(bindings, can_restore));
         }
-        self.rx.try_iter().collect()
+        let notices: Vec<_> = self.rx.try_iter().collect();
+        if notices.iter().any(|n| matches!(n, Notice::ManualFinished(..) | Notice::Error(_))) {
+            self.manual_pending = false;
+        }
+        notices
+    }
+
+    pub fn request(&mut self, action: ManualAction, bindings: Vec<Binding>, ready: bool) -> Result<(), String> {
+        if self.stopped || self.manual_pending { return Err("대화 저장·복원이 이미 진행 중입니다.".into()); }
+        self.tx.send(Message::Manual(action, bindings, ready)).map_err(|_| "대화 기억 기능을 사용할 수 없습니다. 설정과 오류 기록을 확인하세요.".to_owned())?;
+        self.manual_pending = true;
+        Ok(())
     }
 
     pub fn completed(&self, plan: &Plan, new: Option<(String, u32)>, error: Option<String>) {
@@ -492,12 +510,14 @@ fn worker(
         let mut messages = vec![message];
         messages.extend(input.try_iter());
         let mut stop = None;
+        let mut manual = None;
         for message in messages {
             match message {
                 Message::Frame(bindings, ready) => {
                     frames = bindings;
                     can_restore = ready;
                 }
+                Message::Manual(action, bindings, ready) => { manual = Some((action, bindings, ready)); }
                 Message::Result(pane, sid, new, error) => {
                     if let Some(entry) =
                         store.entries.get_mut(&pane).filter(|e| e.session_id == sid)
@@ -516,6 +536,14 @@ fn worker(
                 }
             }
         }
+        let action = manual.as_ref().map(|(action, _, _)| *action);
+        if let Some((action, bindings, ready)) = manual {
+            frames = bindings;
+            can_restore = ready && action == ManualAction::Restore;
+            if ready { prepare_manual(&mut store, &frames, action); }
+        }
+        let mut queued = 0;
+        let mut manual_error = None;
         let stamp = |directory: PathBuf| {
             std::fs::read_dir(directory)
                 .into_iter()
@@ -532,7 +560,7 @@ fn worker(
             stamp(std::env::temp_dir().join("CodexTerminalTitles"))
         );
         if !frames.is_empty()
-            && (stop.is_some()
+            && (action.is_some() || stop.is_some()
                 || trigger != last_trigger
                 || last_scan.elapsed() >= Duration::from_secs(300))
         {
@@ -551,11 +579,13 @@ fn worker(
                         // Durably claim before dispatch. A crash or second window never replays
                         // an ambiguous launch; a new real process observation clears the claim.
                         save(&path, &store)?;
+                        queued += 1;
                         let _ = output.send(Notice::Restore(plan));
                     }
                 }
                 Err(error) => {
                     let error = format!("{error:#}");
+                    manual_error = Some(error.clone());
                     if error != last_error {
                         let _ = output.send(Notice::Error(error.clone()));
                         last_error = error;
@@ -567,10 +597,21 @@ fn worker(
             store.unresolved.clear();
         }
         let body = serde_json::to_string(&(&store.entries, &store.unresolved))?;
-        if body != written || now().saturating_sub(store.checked_ms) >= 300_000 || stop.is_some() {
+        if action.is_some() || body != written || now().saturating_sub(store.checked_ms) >= 300_000 || stop.is_some() {
             store.checked_ms = now();
             save(&path, &store)?;
             written = body;
+        }
+        if let Some(action) = action {
+            let result = manual_error.map_or_else(|| {
+                let active = store.entries.values().filter(|e| e.active).count();
+                let issues = store.unresolved.len() + store.entries.values().filter(|e| e.error.is_some() && e.error.as_deref() != Some("Restore requested") && !store.unresolved.contains_key(&e.pane)).count();
+                Ok(match action {
+                    ManualAction::Save => format!("대화 연결 {active}개를 저장했습니다. 확인이 필요한 항목: {issues}개."),
+                    ManualAction::Restore => format!("복원 검사를 완료했습니다. 재개 요청: {queued}개, 확인 필요: {issues}개. 실행 중인 대화는 유지했습니다."),
+                })
+            }, Err);
+            let _ = output.send(Notice::ManualFinished(action, result));
         }
         if let Some(ack) = stop {
             let _ = ack.send(());
@@ -578,6 +619,19 @@ fn worker(
         }
     }
     Ok(())
+}
+
+fn prepare_manual(store: &mut Store, bindings: &[Binding], action: ManualAction) {
+    store.entries.retain(|pane, _| bindings.iter().any(|b| b.pane == *pane));
+    store.unresolved.retain(|pane, _| bindings.iter().any(|b| b.pane == *pane));
+    if action == ManualAction::Restore {
+        for entry in store.entries.values_mut() {
+            // An explicit retry may recheck a failed launch, never an in-flight one.
+            if entry.error.is_some() && entry.error.as_deref() != Some("Restore requested") {
+                entry.attempted_root.clear();
+            }
+        }
+    }
 }
 
 fn observe(
@@ -963,6 +1017,44 @@ mod tests {
         assert!(resume_argv(&e).is_err());
         assert!(!valid_id("../../other"));
         assert!(valid_id(&e.session_id));
+    }
+    #[test]
+    fn manual_actions_prune_closed_panes_and_retry_failures_without_replaying_pending_launches() {
+        let mut e = entry();
+        e.error = Some("missing transcript".into());
+        e.attempted_root = "20:new".into();
+        let mut s = store(e);
+        prepare_manual(&mut s, &[binding()], ManualAction::Save);
+        assert_eq!(s.entries["p"].attempted_root, "20:new");
+        prepare_manual(&mut s, &[binding()], ManualAction::Restore);
+        assert!(s.entries["p"].attempted_root.is_empty());
+        let e = s.entries.get_mut("p").unwrap();
+        e.error = Some("Restore requested".into());
+        e.attempted_root = "20:new".into();
+        prepare_manual(&mut s, &[binding()], ManualAction::Restore);
+        assert_eq!(s.entries["p"].attempted_root, "20:new");
+        s.unresolved.insert("p".into(), "unresolved".into());
+        prepare_manual(&mut s, &[], ManualAction::Save);
+        assert!(s.entries.is_empty());
+        assert!(s.unresolved.is_empty());
+    }
+
+    #[test]
+    fn manual_requests_are_serialized_and_worker_failure_is_reported() {
+        let (tx, input) = mpsc::channel();
+        let (output, rx) = mpsc::channel();
+        let mut manager = Manager { tx, rx, last_frame: Some(Instant::now()), stopped: false, manual_pending: false };
+        assert!(manager.request(ManualAction::Save, vec![], true).is_ok());
+        assert!(manager.request(ManualAction::Restore, vec![], true).is_err());
+        assert!(matches!(input.try_recv().unwrap(), Message::Manual(ManualAction::Save, _, true)));
+        output.send(Notice::ManualFinished(ManualAction::Save, Ok("saved".into()))).unwrap();
+        assert_eq!(manager.update(vec![], true).len(), 1);
+        assert!(manager.request(ManualAction::Restore, vec![], true).is_ok());
+        output.send(Notice::Error("worker stopped".into())).unwrap();
+        manager.update(vec![], true);
+        drop(input);
+        assert!(manager.request(ManualAction::Save, vec![], true).is_err());
+        manager.stopped = true;
     }
     #[test]
     fn live_ai_and_core_reconnect_never_restore() {
