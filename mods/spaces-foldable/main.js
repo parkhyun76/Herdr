@@ -5,7 +5,7 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
+import { spaces, machines, panes, props, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -40,6 +40,8 @@ const STATUS_RANK = { blocked: 4, done: 3, working: 2, idle: 1 };
 
 export default class Spaces extends View {
   init(_props, cx) {
+    const config = props();
+    this.parents = config?.parents && typeof config.parents === "object" && !Array.isArray(config.parents) ? config.parents : {};
     this.git = {}; // where() -> { name, branch, ahead, behind, repo, linked }, null: not a repo
     this.checked = {}; // where() -> when it was last looked at
     this.unsure = new Set(); // where()s git couldn't answer for (a machine away)
@@ -55,8 +57,10 @@ export default class Spaces extends View {
     this.pressed = null;
     this.over = null;
     this.machines = [];
-    this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]"));
-    this.foldedWorktrees = new Set(JSON.parse(localStorage.getItem("worktrees.folded") ?? "[]"));
+    const folds = shared("spaces-foldable.folds");
+    this.folded = new Set(folds?.machines ?? JSON.parse(localStorage.getItem("machines.folded") ?? "[]"));
+    this.foldedWorktrees = new Set(folds?.worktrees ?? JSON.parse(localStorage.getItem("worktrees.folded") ?? "[]"));
+    if (!folds) this.saveFolds();
     this.refreshMachines(cx);
     cx.timer.every(15000, cx => this.refreshMachines(cx));
     // `git status` walks the whole tree, on another machine a process there:
@@ -197,29 +201,50 @@ export default class Spaces extends View {
 
   toggleWorktrees(repo, cx) {
     this.foldedWorktrees.has(repo) ? this.foldedWorktrees.delete(repo) : this.foldedWorktrees.add(repo);
-    localStorage.setItem("worktrees.folded", JSON.stringify([...this.foldedWorktrees]));
+    this.saveFolds();
     cx.notify();
   }
 
-  // Spaces in order, each worktree space moved under its main checkout's.
+  saveFolds() {
+    setShared("spaces-foldable.folds", { machines: [...this.folded], worktrees: [...this.foldedWorktrees] });
+  }
+
+  // Explicit role groups survive sharing one checkout; Git worktrees still group automatically.
   ordered() {
     const sp = spaces(), ps = panes();
     const ready = (w) => this.shown.has(w.id) || where(w, ps) in this.git || Date.now() - (this.born[w.id] ??= Date.now()) > 1500;
     for (const w of sp) if (!this.shown.has(w.id) && ready(w)) this.shown.add(w.id);
     const list = sp.map((w, i) => ({ w, i, status: w.status ?? null, g: this.git[where(w, ps)] ?? null })).filter((r) => this.shown.has(r.w.id));
-    const mains = new Set(list.filter((r) => r.g && !r.g.linked).map((r) => r.g.repo));
-    const nested = (r) => r.g?.linked && mains.has(r.g.repo);
-    const out = [];
-    const placed = new Set(); // repos whose worktrees are listed (under the first of its spaces)
+    const byId = new Map(list.map((r) => [r.w.id, r]));
+    const parents = new Map();
     for (const r of list) {
-      if (nested(r)) continue;
+      const parent = byId.get(this.parents[r.w.id]);
+      if (parent && parent !== r && !this.parents[parent.w.id] && (parent.w.machine ?? null) === (r.w.machine ?? null)) parents.set(r.w.id, parent.w.id);
+    }
+    const mains = new Map();
+    for (const r of list) if (r.g && !r.g.linked && !parents.has(r.w.id) && !mains.has(r.g.repo)) mains.set(r.g.repo, r.w.id);
+    const parentOf = (r) => {
+      const explicit = parents.get(r.w.id);
+      if (!explicit) return r.g?.linked ? mains.get(r.g.repo) : null;
+      const parent = byId.get(explicit);
+      return (parent.g?.linked && mains.get(parent.g.repo)) || explicit;
+    };
+    const out = [];
+    for (const r of list) {
+      if (parentOf(r)) continue;
       const parent = { ...r, tree: null };
       out.push(parent);
-      if (!r.g || r.g.linked || placed.has(r.g.repo)) continue;
-      placed.add(r.g.repo);
-      const kids = list.filter((k) => nested(k) && k.g.repo === r.g.repo);
-      if (kids.length) parent.group = r.g.repo;
-      if (this.foldedWorktrees.has(r.g.repo)) {
+      const kids = list.filter((k) => parentOf(k) === r.w.id);
+      if (!kids.length) continue;
+      const explicit = kids.some((k) => parents.has(k.w.id));
+      const group = explicit ? JSON.stringify([r.w.machine ?? null, "space", r.w.id]) : r.g?.repo;
+      if (explicit && r.g?.repo && this.foldedWorktrees.has(r.g.repo)) {
+        this.foldedWorktrees.delete(r.g.repo);
+        this.foldedWorktrees.add(group);
+        this.saveFolds();
+      }
+      parent.group = group;
+      if (this.foldedWorktrees.has(group)) {
         // Hidden worktrees still surface the most urgent agent state.
         parent.status = kids.reduce((top, k) => (STATUS_RANK[k.status] ?? 0) > (STATUS_RANK[top] ?? 0) ? k.status : top, parent.status);
         continue;
@@ -251,7 +276,7 @@ export default class Spaces extends View {
         .cursor_pointer().hover(s => s.bg(t.hover))
         .on_click((_e, cx) => {
           folded ? this.folded.delete(m) : this.folded.add(m);
-          localStorage.setItem("machines.folded", JSON.stringify([...this.folded]));
+          this.saveFolds();
           cx.notify();
         })
         .child(svg(`mods/workspace-chrome/${m ? "server" : "monitor"}.svg`).size(13).flex_none())
