@@ -119,8 +119,9 @@ export default class Changes extends View {
         // The first file's diff shows until you pick another.
         if (!this.open && !this.closed && this.files.length) this.open = this.files[0].path;
         if (this.open) {
-          try { await this.load(this.open, context); }
-          catch { if (!stale()) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
+          const path = this.open, diffGen = this.diffGen + 1;
+          try { await this.load(path, context); }
+          catch { if (!stale() && this.open === path && this.diffGen === diffGen) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
         }
       } catch (e) {
         if (!stale()) {
@@ -163,10 +164,11 @@ export default class Changes extends View {
   pick(path, cx) {
     this.open = this.open === path ? null : path; this.setLines([]); this.note = null; this.diffGen++;
     this.closed = !this.open;
-    const context = this.context;
+    const context = this.context, selected = this.selectedCommit;
     if (this.open) cx.spawn(async (cx) => {
+      const gen = this.diffGen + 1;
       try { await this.load(path, context); }
-      catch (e) { if (this.key() === context && this.open === path) this.note = `Cannot preview this diff (too large or unreadable): ${e}`; }
+      catch (e) { if (this.key() === context && this.open === path && this.selectedCommit === selected && this.diffGen === gen) this.note = `Cannot preview this diff (too large or unreadable): ${e}`; }
       cx.notify();
     });
     cx.notify();

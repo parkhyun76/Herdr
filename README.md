@@ -14,7 +14,7 @@ Apache-2.0 및 각 의존성의 라이선스·저작권을 유지한다.
 
 | 경로 | 내용 |
 |---|---|
-| `mods/changes-branch/` | 우측 Changes 패널. 기본 `changes` mod를 복제해 **Working / vs main** 전환을 추가 |
+| `mods/changes-branch/` | 우측 Changes 패널. **Working / 미푸시 / vs main** 전환과 커밋별 변경 조회 |
 | `mods/spaces-foldable/` | 좌측 Spaces 목록. 워크트리를 메인 체크아웃 아래로 접고, git 저장소 공간 아바타 왼쪽에 **+ (새 워크트리)** 버튼 |
 | `mods/tabs-inline-add/`, `mods/files-utf8/` | 탭 바, Files 패널 복제본 |
 | `layouts/main-worktree-folding.json` | 위 mod들을 쓰는 레이아웃 |
@@ -58,7 +58,10 @@ Herdr 안내(`AGENTS.md`)에 따르면 업데이트는 기본 mod·레이아웃�
 - **Working**: 커밋하지 않은 변경 (`git status`, `git diff HEAD`) + 커밋 입력창
 - **vs main**: 브랜치가 main에서 갈라진 뒤 커밋한 내용 (`git diff <base>...HEAD`)과 ahead/behind 수.
   base는 `main` → `master` → `origin/main` → `origin/master` 중 처음 있는 것.
+- **미푸시**: 추적 브랜치에 없는 커밋의 메시지·작성 시각을 표시하고, 커밋을 선택하면 해당 커밋의 파일과 상세 차이를 보여준다. `main`에서도 사용할 수 있으며 커밋 전 수정은 섞이지 않는다.
+  로컬에 저장된 원격 정보를 기준으로 읽고 자동 fetch/push는 하지 않는다. 원격 미설정·참조 누락·조회 오류를 빈 목록과 구분한다. 최근 100개 커밋을 표시하며 전체 미푸시 수는 탭에 표시한다.
 - 전환: 패널 버튼, 또는 `herdr-app do changes-branch.toggle` (`working` / `branch`).
+  미푸시 탭은 `herdr-app do changes-branch.unpushed`로 열 수 있다. 좌측 `↑숫자`의 동작은 바꾸지 않는다.
   `keys.json`에 `"changes-branch:toggle"`을 연결하면 단축키로 쓸 수 있다.
 - 사용 레이아웃 `main-worktree-folding`의 `changes` 블록이 이 mod를 가리킨다.
 

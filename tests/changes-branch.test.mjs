@@ -160,9 +160,32 @@ test("unpublished history reports query failure instead of showing an empty list
   const repo = trackedRepo();
   try {
     const git = runner(repo.dir);
-    await assert.rejects(() => collectUnpushed(args => args[0] === "log"
-      ? Promise.resolve({ code: 1, stdout: "", stderr: "object database read failure" }) : git(args)), /object database read failure/);
+    for (const command of ["symbolic-ref", "for-each-ref", "rev-list", "log"]) {
+      await assert.rejects(() => collectUnpushed(args => args[0] === command
+        ? Promise.resolve({ code: 128, stdout: "", stderr: "object database read failure" }) : git(args)), /object database read failure/);
+    }
+    const hash = sh(repo.dir, "rev-parse", "HEAD");
+    for (const flag of ["--name-status", "--numstat"]) {
+      await assert.rejects(() => collectCommit(args => args.includes(flag)
+        ? Promise.resolve({ code: 128, stdout: "", stderr: "commit read failure" }) : git(args), hash), /commit read failure/);
+    }
   } finally { repo.close(); }
+});
+
+test("a long unpublished history retains the total count while limiting the displayed commits", async () => {
+  const git = async args => {
+    if (args[0] === "symbolic-ref") return { code: 0, stdout: "main\n" };
+    if (args[0] === "for-each-ref") return { code: 0, stdout: "origin/main\n" };
+    if (args[0] === "rev-parse") return { code: 0, stdout: "a".repeat(40) };
+    if (args[0] === "rev-list") return { code: 0, stdout: "0\t105\n" };
+    assert.equal(args[0], "log");
+    const limit = Number(args.find(arg => arg.startsWith("--max-count=")).split("=")[1]);
+    return { code: 0, stdout: Array.from({ length: Math.min(105, limit) }, (_, i) => `${(i + 1).toString(16).padStart(40, "0")}\0${"2026-11-03T12:00:00+09:00"}\0change ${i}\0`).join("") };
+  };
+  const result = await collectUnpushed(git);
+  assert.equal(result.ahead, 105);
+  assert.equal(result.commits.length, 100);
+  assert.equal(result.limited, true);
 });
 
 // The real PHM-VB-BT worktrees on this PC: the panel must agree with git asked directly.
