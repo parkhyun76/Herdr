@@ -12,7 +12,7 @@ use windows::Win32::{
             SetClipboardData,
         },
         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
-        Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT},
+        Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT},
     },
     UI::Shell::{DragQueryFileW, HDROP},
 };
@@ -175,7 +175,7 @@ fn get_clipboard_string(format: u32) -> Option<String> {
 }
 
 fn is_image_format(format: u32) -> bool {
-    IMAGE_FORMATS_MAP.contains_key(&format) || format == CF_DIB.0 as u32
+    IMAGE_FORMATS_MAP.contains_key(&format) || format == CF_DIB.0 as u32 || format == CF_DIBV5.0 as u32
 }
 
 fn write_string(item: &ClipboardString) -> Result<()> {
@@ -251,7 +251,7 @@ fn read_clipboard_metadata(text: &str) -> Option<String> {
 
 fn read_image(format: u32) -> Option<ClipboardEntry> {
     let locked = get_clipboard_data(format)?;
-    let (bytes, image_format) = if format == CF_DIB.0 as u32 {
+    let (bytes, image_format) = if format == CF_DIB.0 as u32 || format == CF_DIBV5.0 as u32 {
         (convert_dib_to_bmp(locked.as_bytes())?, ImageFormat::Bmp)
     } else {
         let image_format = *IMAGE_FORMATS_MAP.get(&format)?;
@@ -282,6 +282,7 @@ fn convert_dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
     }
 
     let header_size = u32::from_le_bytes(dib[0..4].try_into().ok()?);
+    if header_size < 40 || header_size as usize > dib.len() { return None; }
     let bit_count = u16::from_le_bytes(dib[14..16].try_into().ok()?);
     let compression = u32::from_le_bytes(dib[16..20].try_into().ok()?);
 
@@ -291,15 +292,17 @@ fn convert_dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
             1u32 << bit_count
         } else {
             colors_used
-        }) * 4
-    } else if compression == 3 {
+        }).checked_mul(4)?
+    } else if compression == 3 && header_size == 40 {
         12 // BI_BITFIELDS
     } else {
         0
     };
 
-    let pixel_offset = 14 + header_size + color_table_size;
-    let file_size = 14 + dib.len() as u32;
+    // V4/V5 contain the masks inside the header; adding 12 shifts screenshot pixels.
+    let pixel_offset = 14u32.checked_add(header_size)?.checked_add(color_table_size)?;
+    let file_size = 14u32.checked_add(u32::try_from(dib.len()).ok()?)?;
+    if pixel_offset > file_size { return None; }
 
     let mut bmp = Vec::with_capacity(file_size as usize);
     bmp.extend_from_slice(b"BM");

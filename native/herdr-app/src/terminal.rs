@@ -39,6 +39,7 @@ pub enum TerminalEvent {
     Ended,
     /// Right-click where the program doesn't take the mouse: the pane menu.
     ContextMenu(Point<Pixels>),
+    ClipboardError(String),
 }
 
 /// What the canvas closures need, shared outside the entity so prepaint can resize.
@@ -87,6 +88,8 @@ pub struct TerminalView {
     selection_scroll: Option<Task<()>>,
     /// Windows buffers a program's click while a drag can become a local selection.
     deferred_click: Option<(Point<Pixels>, Modifiers)>,
+    /// Keep a finished selection available if a TUI redraw clears the VT highlight.
+    selection_copy: Option<String>,
     /// The terminal's folder, for links to relative paths.
     pub cwd: Option<PathBuf>,
     /// The link under the pointer while the link modifier is held.
@@ -185,6 +188,7 @@ impl TerminalView {
             selection_pointer: Point::default(),
             selection_scroll: None,
             deferred_click: None,
+            selection_copy: None,
             cwd: None,
             link: None,
             right_click_to_program: false,
@@ -494,6 +498,8 @@ impl TerminalView {
     /// Text as a paste; copied files (Finder, a clipboard manager's image) as
     /// if dropped; an image alone (a screenshot) as Ctrl+V pastes it.
     pub fn paste(&mut self, cx: &mut Context<Self>) {
+        self.selection_copy = None;
+        self.grid.borrow_mut().vt.clear_selection();
         let Some(item) = cx.read_from_clipboard() else { return };
         if let Some(paths) = copied_files(&item) {
             self.dropped(paths, cx);
@@ -505,12 +511,18 @@ impl TerminalView {
         }
     }
 
-    /// Ctrl+V: a remote image, clipboard text on Windows, or the key itself.
+    /// Clipboard images are read by this window, including for local Windows agents.
     pub fn paste_image(&mut self, cx: &mut Context<Self>) {
+        self.selection_copy = None;
+        self.grid.borrow_mut().vt.clear_selection();
         if self.send_image(cx) {
             return;
         }
         let text = if cfg!(windows) { cx.read_from_clipboard().and_then(|c| c.text()) } else { None };
+        if cfg!(windows) && text.is_none() {
+            cx.emit(TerminalEvent::ClipboardError("클립보드에 읽을 수 있는 이미지나 텍스트가 없습니다. 캡처 후 다시 시도하세요.".into()));
+            return;
+        }
         let bytes = paste_image_fallback(&mut self.grid.borrow_mut().vt, text.as_deref());
         if let Some(bytes) = bytes {
             self.send(&bytes);
@@ -518,20 +530,70 @@ impl TerminalView {
     }
 
     /// An agent on another machine reads that machine's clipboard, so this
-    /// one's image goes there as a file, and its path is pasted. A local
-    /// program reads the clipboard itself: nothing to do.
-    fn send_image(&self, cx: &mut Context<Self>) -> bool {
-        if !self.address.contains('/') {
+    /// one's image goes there as a file. Windows agents can run in another
+    /// desktop session, so local images also travel as files rather than keys.
+    fn send_image(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.address.contains('/') && !cfg!(windows) {
             return false;
         }
-        let Some(path) = cx.read_from_clipboard().and_then(|item| image_file(&item)) else { return false };
-        self.put_there(vec![path], true, cx);
+        let Some(item) = cx.read_from_clipboard() else { return false };
+        let path = match image_file(&item) {
+            Ok(Some(path)) => path,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!("clipboard image could not be prepared: {error:#}");
+                cx.emit(TerminalEvent::ClipboardError(format!("이미지를 준비하지 못했습니다: {error:#}")));
+                return true;
+            }
+        };
+        if self.address.contains('/') { self.put_there(vec![path], true, cx); }
+        else { self.bridge_image(path, cx); }
         true
+    }
+
+    fn bridge_image(&self, path: PathBuf, cx: &mut Context<Self>) {
+        let core = self.grid.borrow().core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_executor().spawn(async move {
+                use base64::Engine as _;
+                let script: Vec<u8> = include_str!("clipboard_image.ps1").encode_utf16().flat_map(u16::to_le_bytes).collect();
+                let encoded = base64::engine::general_purpose::STANDARD.encode(script);
+                // machine.exec uses the desktop session; a short, unkept terminal
+                // inherits the same Windows station as the AI's terminal holder.
+                let result = core.call_timeout("terminal.run", json!({
+                    "argv":["powershell.exe","-NoProfile","-NonInteractive","-STA","-EncodedCommand",encoded],
+                    "env":{"HERDR_CLIPBOARD_IMAGE":path.to_string_lossy()},
+                    "keep":false,"no_parent":true,"no_notify":true,"rm":true,"wait":true,"timeout":10
+                }), Duration::from_secs(15));
+                let _ = std::fs::remove_file(&path);
+                let result = result?;
+                if result.pointer("/wait/ended") != Some(&json!(true)) {
+                    if let Some(address) = result["address"].as_str() {
+                        let _ = core.call("terminal.kill", json!({"terminal":address}));
+                    }
+                    anyhow::bail!("AI 세션으로 클립보드를 전달하는 시간이 초과됐습니다");
+                }
+                anyhow::ensure!(result.pointer("/wait/exit_code") == Some(&json!(0)), "AI 세션에서 클립보드 이미지를 준비하지 못했습니다");
+                Ok::<_, anyhow::Error>(())
+            }).await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    let bytes = paste_image_fallback(&mut this.grid.borrow_mut().vt, None);
+                    if let Some(bytes) = bytes { this.send(&bytes); }
+                }
+                Err(error) => {
+                    tracing::warn!("AI clipboard bridge: {error:#}");
+                    cx.emit(TerminalEvent::ClipboardError(format!("{error:#}")));
+                }
+            });
+        }).detach();
     }
 
     /// Copies the selection to the clipboard (and the primary selection on Linux).
     pub fn copy(&mut self, cx: &mut Context<Self>) {
-        if let Some(text) = self.grid.borrow().vt.selection_text() {
+        let text = self.grid.borrow().vt.selection_text().or_else(|| self.selection_copy.clone());
+        if let Some(text) = text {
+            if cfg!(windows) { self.selection_copy = Some(text.clone()); }
             cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
             #[cfg(target_os = "linux")]
             cx.write_to_primary(ClipboardItem::new_string(text));
@@ -540,8 +602,15 @@ impl TerminalView {
 
     fn key_down(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
+        let shortcut = local_shortcut(cfg!(windows), k, self.selection_copy.is_some() || self.grid.borrow().vt.selection_text().is_some());
+        match shortcut {
+            Some(LocalShortcut::Copy) => { self.copy(cx); cx.stop_propagation(); return; }
+            Some(LocalShortcut::PasteImage) => { self.paste_image(cx); cx.stop_propagation(); return; }
+            None => {}
+        }
         // Typing clears a selection, as in Herdr.
-        if !k.key.starts_with("shift") && !k.key.starts_with("control") && !k.key.starts_with("alt") {
+        if !k.key.starts_with("shift") && !k.key.starts_with("control") && k.key != "ctrl" && !k.key.starts_with("alt") {
+            self.selection_copy = None;
             self.grid.borrow_mut().vt.clear_selection();
         }
         let bytes = key_bytes(&mut self.grid.borrow_mut().vt, ev);
@@ -647,6 +716,7 @@ impl TerminalView {
     }
 
     fn start_selection(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        self.selection_copy = None;
         self.selecting = true;
         self.selection_pointer = pos;
         self.select(Select::Press, pos, cx);
@@ -724,6 +794,17 @@ fn local_left_selection(windows: bool, program_takes_mouse: bool, control: bool)
     !program_takes_mouse || (windows && !control)
 }
 
+#[derive(Debug, PartialEq)]
+enum LocalShortcut { Copy, PasteImage }
+
+fn local_shortcut(windows: bool, key: &Keystroke, selected: bool) -> Option<LocalShortcut> {
+    if !windows || key.modifiers.platform || key.modifiers.shift { return None; }
+    let m = key.modifiers;
+    if key.key == "c" && m.control && !m.alt && selected { Some(LocalShortcut::Copy) }
+    else if key.key == "v" && m.alt && !m.control { Some(LocalShortcut::PasteImage) }
+    else { None }
+}
+
 /// A title as it's shown: an agent's spinner in front of it (`\u{2733} Fix the
 /// tests`, braille dots) is no part of it. Herdr draws its own, and a title
 /// that spins would redraw every mod that shows titles, 10 times a second.
@@ -762,12 +843,12 @@ fn copied_files(item: &ClipboardItem) -> Option<Vec<std::path::PathBuf>> {
 }
 
 /// The clipboard's image saved to a file of its own, for its path to be pasted.
-fn image_file(item: &ClipboardItem) -> Option<std::path::PathBuf> {
-    let image = item.entries().iter().find_map(|e| match e {
+fn image_file(item: &ClipboardItem) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let Some(image) = item.entries().iter().find_map(|e| match e {
         ClipboardEntry::Image(i) => Some(i),
         _ => None,
-    })?;
-    let (format, bytes) = paste_image_bytes(image.format, &image.bytes)?;
+    }) else { return Ok(None) };
+    let (format, bytes) = paste_image_bytes(image.format, &image.bytes).ok_or_else(|| anyhow::anyhow!("클립보드 이미지 형식을 해석할 수 없습니다"))?;
     let ext = match format {
         ImageFormat::Jpeg => "jpg",
         ImageFormat::Gif => "gif",
@@ -775,10 +856,10 @@ fn image_file(item: &ClipboardItem) -> Option<std::path::PathBuf> {
         ImageFormat::Svg => "svg",
         _ => "png",
     };
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
     let path = std::env::temp_dir().join(format!("herdr-paste-{stamp}.{ext}"));
-    std::fs::write(&path, bytes).ok()?;
-    Some(path)
+    std::fs::write(&path, bytes)?;
+    Ok(Some(path))
 }
 
 fn paste_image_bytes(format: ImageFormat, bytes: &[u8]) -> Option<(ImageFormat, std::borrow::Cow<'_, [u8]>)> {
@@ -1837,6 +1918,50 @@ mod tests {
             is_held: false,
             prefer_character_input: false,
         }
+    }
+
+    #[test]
+    fn selected_ctrl_c_is_local_copy_and_unselected_ctrl_c_remains_interrupt() {
+        use super::{local_shortcut, LocalShortcut};
+        use crate::vt::Select;
+        let mut vt = Vt::new(20, 3);
+        vt.write(b"hello world\r\nsecond");
+        vt.select(Select::Press, 0, 0, 2.0, 5.0, 10.0, 60.0);
+        vt.select(Select::Drag, 4, 0, 46.0, 5.0, 10.0, 60.0);
+        vt.select(Select::Release, 4, 0, 46.0, 5.0, 10.0, 60.0);
+        assert_eq!(vt.selection_text().as_deref(), Some("hello"));
+        let copy = press("ctrl-c", None);
+        assert_eq!(local_shortcut(true, &copy.keystroke, vt.selection_text().is_some()), Some(LocalShortcut::Copy));
+        assert_eq!(local_shortcut(true, &copy.keystroke, false), None);
+        assert_eq!(super::key_bytes(&mut vt, &copy).unwrap(), b"\x03");
+        assert_eq!(local_shortcut(true, &press("alt-v", None).keystroke, false), Some(LocalShortcut::PasteImage));
+        for key in ["c", "alt-c", "ctrl-alt-v", "ctrl-shift-c"] {
+            assert_eq!(local_shortcut(true, &press(key, None).keystroke, true), None, "{key}");
+        }
+        assert_eq!(local_shortcut(false, &copy.keystroke, true), None);
+    }
+
+    #[test]
+    fn clipboard_image_file_preserves_pixels_and_pastes_as_a_quoted_path() {
+        use gpui::{ClipboardItem, Image, ImageFormat};
+        let source = image::DynamicImage::new_rgba8(3, 2);
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        source.write_to(&mut encoded, image::ImageFormat::Bmp).unwrap();
+        let item = ClipboardItem::new_image(&Image::from_bytes(ImageFormat::Bmp, encoded.into_inner()));
+        let path = super::image_file(&item).unwrap().unwrap();
+        let decoded = image::open(&path).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (3, 2));
+        let mut vt = Vt::new(80, 3);
+        vt.write(b"\x1b[?2004h");
+        let text = super::quote_paths([path.to_string_lossy().into_owned()]);
+        let bytes = vt.paste_bytes(&text);
+        assert!(bytes.starts_with(b"\x1b[200~"));
+        assert!(bytes.ends_with(b"\x1b[201~"));
+        assert!(!bytes.contains(&3));
+        std::fs::remove_file(path).unwrap();
+        assert!(super::image_file(&ClipboardItem::new_string("text".into())).unwrap().is_none());
+        let broken = ClipboardItem::new_image(&Image::from_bytes(ImageFormat::Bmp, b"broken".to_vec()));
+        assert!(super::image_file(&broken).is_err());
     }
 
     #[test]

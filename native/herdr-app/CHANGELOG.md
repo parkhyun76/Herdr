@@ -1,5 +1,12 @@
 # Herdr changelog
 
+## [0.1.12-personal.2] - 2026-11-03
+
+### Fixed
+- Windows Alt+V and Ctrl+V bridge clipboard images into the AI terminal's Windows session before attaching them.
+- Ctrl+C copies a selected conversation without interrupting the AI. Drag selections copy automatically and remain copyable through TUI redraws.
+- Screenshot DIBV5 images retain their correct pixel offsets and colors.
+
 ## [0.1.12-personal.1] - 2026-11-03
 
 ### New

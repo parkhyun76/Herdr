@@ -125,3 +125,46 @@ try { [Console]::WriteLine('locked'); [Console]::Out.Flush(); [void][Console]::R
     platform.write_to_clipboard(item.clone());
     assert_eq!(platform.read_from_clipboard(), Some(item));
 }
+
+#[test]
+fn screenshot_dibv5_preserves_pixel_offsets_and_colors() {
+    let platform = gpui_platform::current_platform(true);
+    let original = platform.read_from_clipboard();
+    struct Restore(std::rc::Rc<dyn gpui::Platform>, Option<ClipboardItem>);
+    impl Drop for Restore {
+        fn drop(&mut self) { if let Some(item) = self.1.take() { self.0.write_to_clipboard(item); } }
+    }
+    let _restore = Restore(platform.clone(), original);
+    let mut dib = vec![0u8; 132];
+    for (offset, value) in [(0,124u32),(4,2),(8,1),(16,3),(20,8),(40,0x00ff0000),(44,0x0000ff00),(48,0x000000ff),(52,0xff000000),(56,0x73524742)] {
+        dib[offset..offset+4].copy_from_slice(&value.to_le_bytes());
+    }
+    dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+    dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+    dib[124..].copy_from_slice(&[0,0,255,255,255,0,0,255]);
+    let fixture = std::env::temp_dir().join(format!("herdr-dibv5-{}.bin",std::process::id()));
+    std::fs::write(&fixture, dib).unwrap();
+    let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class DibClip { [DllImport("user32.dll")] public static extern bool OpenClipboard(IntPtr h); [DllImport("user32.dll")] public static extern bool EmptyClipboard(); [DllImport("user32.dll")] public static extern bool CloseClipboard(); [DllImport("user32.dll")] public static extern IntPtr SetClipboardData(uint f,IntPtr h); [DllImport("kernel32.dll")] public static extern IntPtr GlobalAlloc(uint f,UIntPtr n); [DllImport("kernel32.dll")] public static extern IntPtr GlobalLock(IntPtr h); [DllImport("kernel32.dll")] public static extern bool GlobalUnlock(IntPtr h); }'
+$owner=[System.Windows.Forms.Form]::new()
+$bytes=[IO.File]::ReadAllBytes('__FIXTURE__')
+if (-not [DibClip]::OpenClipboard($owner.Handle)) { exit 2 }
+try {
+ if (-not [DibClip]::EmptyClipboard()) { exit 3 }
+ $memory=[DibClip]::GlobalAlloc(2,[UIntPtr]::new([uint64]$bytes.Length))
+ $pointer=[DibClip]::GlobalLock($memory)
+ [Runtime.InteropServices.Marshal]::Copy($bytes,0,$pointer,$bytes.Length)
+ [void][DibClip]::GlobalUnlock($memory)
+ if ([DibClip]::SetClipboardData(17,$memory) -eq [IntPtr]::Zero) { exit 4 }
+} finally { [void][DibClip]::CloseClipboard() }
+"#.replace("__FIXTURE__", &fixture.to_string_lossy().replace('\'', "''"));
+    assert!(powershell(&script).status().unwrap().success());
+    std::fs::remove_file(fixture).unwrap();
+    let item = platform.read_from_clipboard().expect("read a screenshot DIBV5");
+    let image = item.entries().iter().find_map(|e| match e { gpui::ClipboardEntry::Image(i) => Some(i), _ => None }).unwrap();
+    let decoded = image::load_from_memory(&image.bytes).unwrap().to_rgba8();
+    assert_eq!(decoded.dimensions(), (2,1));
+    assert_eq!(decoded.get_pixel(0,0).0, [255,0,0,255]);
+    assert_eq!(decoded.get_pixel(1,0).0, [0,0,255,255]);
+}

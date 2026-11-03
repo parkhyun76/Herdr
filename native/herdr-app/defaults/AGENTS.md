@@ -577,10 +577,11 @@ The main ones:
   `terminal.peek {terminal}` (peek over the tab, with keep-as-tab and close),
   `terminal.show {terminal?, pane?}`, `terminal.copy`, `terminal.paste` (copied
   files, such as Finder's or a clipboard manager's image, as if dropped; an image
-  alone as `terminal.paste_image` pastes it), `terminal.paste_image` (Ctrl+V: an
-  image, into a terminal on another machine: copied there, its path pasted; on
-  Windows, clipboard text is pasted; otherwise Ctrl+V goes to the program, which
-  reads the clipboard itself). TIFF and BMP clipboard
+  alone as `terminal.paste_image` pastes it), `terminal.paste_image` (Ctrl+V, and
+  Alt+V on Windows: the GUI reads the image, a short unkept core helper transfers
+  it to the AI's Windows clipboard, then the image key is sent. Remote terminals
+  receive an uploaded file path. Windows also pastes clipboard text. Other local systems
+  send Ctrl+V to the program). TIFF and BMP clipboard
   images are converted to PNG before sending,
   `terminal.right_click {to: "program" | "menu", terminal?}` (where right-clicks go
   when the program takes the mouse; kept as its label `herdr.right-click=program`;
@@ -592,6 +593,10 @@ The main ones:
   with no terminal holding keyboard focus, they use the focused pane or block.
   Dragging a text selection past the terminal's top or bottom scrolls while held;
   releasing stops it. On Windows, left drags select and copy in this window;
+  Ctrl+C with a selected conversation copies locally and never sends the
+  interrupt byte. The completed selection stays copyable through TUI redraws;
+  typing, Esc or starting another selection clears it. Without a selection,
+  Ctrl+C keeps its normal interrupt behavior.
   ordinary clicks still reach mouse-tracking programs on release. Hold Ctrl to
   send a drag to the program instead. On other systems, mouse-tracking programs
   get their mouse events (hold Shift to select text instead). A drag stays with the terminal where it
