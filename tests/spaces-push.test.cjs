@@ -13,7 +13,7 @@ const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8',
 
 function mount(folder, execute, machine = null) {
   const row = { id: 'target', name: 'Target project', folder, machine, tabs: [] };
-  const key = JSON.stringify([machine, folder]), repo = JSON.stringify([machine, folder + '/.git']);
+  const key = JSON.stringify([machine, folder]), repo = JSON.stringify([machine, folder.replace(/\\/g, '/') + '/.git']);
   const info = { branch: 'main', name: 'repo', ahead: 1, behind: 0, repo };
   const queue = [], notifications = [], refreshes = [];
   const context = vm.createContext({
@@ -67,11 +67,12 @@ test('arrow push sends only the clicked branch to its tracking ref despite push 
     const before = git(repo.local, 'status', '--porcelain');
     const mounted = mount(repo.local, runner);
     mounted.view.push(mounted.row, mounted.info, mounted.cx); await mounted.flush();
+    assert.equal(mounted.notifications.at(-1).level, 'success', mounted.notifications.at(-1).body);
     assert.equal(git(repo.remote, 'rev-parse', 'refs/heads/review'), git(repo.local, 'rev-parse', 'HEAD'));
     assert.equal(git(repo.remote, 'for-each-ref', '--format=%(refname)'), 'refs/heads/review');
     assert.equal(git(trap, 'for-each-ref', '--format=%(refname)'), '');
     assert.equal(git(repo.local, 'status', '--porcelain'), before);
-    assert.equal(mounted.notifications.at(-1).level, 'success');
+    assert.equal(git(repo.local, 'rev-list', '--count', 'origin/review..HEAD'), '0');
     assert.equal(mounted.view.pushing.size, 0);
     assert.deepEqual(mounted.refreshes.at(-1), [mounted.key]);
   } finally { repo.close(); }

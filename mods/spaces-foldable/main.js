@@ -5,7 +5,7 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { spaces, machines, panes, props, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
+import { spaces, machines, panes, props, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, notify } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -50,6 +50,7 @@ export default class Spaces extends View {
     this.ready = {}; // machine -> its layout was readable at the last look
     this.at = {}; // space -> its where() at the last look
     this.watching = new Set(); // local repos' git folders
+    this.pushing = new Set(); // common repos with a push already in flight
     // Spaces made while this runs wait (at most a moment) for their git, so a
     // worktree appears under its repo instead of jumping there.
     this.shown = new Set(spaces().map((s) => s.id));
@@ -205,6 +206,41 @@ export default class Spaces extends View {
     cx.notify();
   }
 
+  push(w, g, cx) {
+    if (!g?.branch || g.ahead < 1 || this.pushing.has(g.repo)) return;
+    const key = where(w, panes()), [on, cwd] = JSON.parse(key);
+    if (!cwd) return;
+    this.pushing.add(g.repo);
+    cx.notify();
+    cx.spawn(async (cx) => {
+      const git = async args => {
+        const result = await exec("git", args, { cwd, on });
+        if (result.code !== 0) throw new Error((result.stderr || result.stdout || "Git command failed").trim());
+        return result.stdout.trim();
+      };
+      try {
+        const branch = await git(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+        if (branch !== g.branch) throw new Error("브랜치가 변경되었습니다. 갱신된 화살표를 다시 클릭하세요.");
+        const common = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+        if (JSON.stringify([on, common]) !== g.repo) throw new Error("저장소 경로가 변경되었습니다. 갱신된 화살표를 다시 클릭하세요.");
+        const [remote, ref] = (await git(["for-each-ref", "--format=%(upstream:remotename)%00%(upstream:remoteref)", "--", `refs/heads/${branch}`])).split("\0");
+        if (!remote || remote === "." || !ref?.startsWith("refs/heads/")) throw new Error("추적 원격 브랜치가 없습니다. upstream 설정을 확인하세요.");
+        const hash = await git(["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]);
+        if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(hash)) throw new Error("푸시할 커밋을 확인할 수 없습니다.");
+        // Explicit tracking ref: push defaults, mirror mode and tags cannot expand this click.
+        await git(["-c", `remote.${remote}.mirror=false`, "-c", "push.followTags=false", "push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no", "--", remote, `${hash}:${ref}`]);
+        notify({ title: `${w.name} 푸시 완료`, body: `${branch} → ${remote}/${ref.slice(11)}`, level: "success" });
+      } catch (e) {
+        const body = String(e).replace(/(https?:\/\/)[^\s/@]+@/gi, "$1[redacted]@");
+        notify({ title: `${w.name} 푸시 실패`, body, level: "error", timeout: 15000 });
+      } finally {
+        this.pushing.delete(g.repo);
+        this.refreshGit(new Set(this.sameRepo(key, new Set(Object.keys(this.git)))), cx);
+        cx.notify();
+      }
+    });
+  }
+
   saveFolds() {
     setShared("spaces-foldable.folds", { machines: [...this.folded], worktrees: [...this.foldedWorktrees] });
   }
@@ -297,12 +333,13 @@ export default class Spaces extends View {
   // Only what's unusual, after the name: "herdr \u00b7 spike \u21912 \u21931". The repo or
   // branch goes when the name already says it (a worktree is named after its branch),
   // and master/main go: nearly every space is on one.
-  gitTail(g, tree, name, t) {
+  gitTail(g, tree, name, t, w) {
     const raw = g.branch ?? "detached";
     const same = (a) => a.toLowerCase() === name.toLowerCase();
     const branch = same(raw) || raw === "master" || raw === "main" ? "" : raw;
     const repo = tree || same(g.name) ? "" : g.name;
     const where = [repo, branch].filter(Boolean).join(" \u00b7 ");
+    const pushing = this.pushing.has(g.repo);
     return h_flex()
       .flex_1()
       .min_w(0)
@@ -312,7 +349,13 @@ export default class Spaces extends View {
       .text_size(11.5)
       .text_color(t.dim)
       .when(Boolean(where), (el) => el.child(div().min_w(0).truncate().child(where)))
-      .when(g.ahead > 0, (el) => el.child(div().flex_none().text_color(t.ansi2).child(`\u2191${g.ahead}`)))
+      .when(g.ahead > 0 || pushing, (el) => el.child(div().id(`space-push-${w.id}`).flex_none().px(3).rounded(4).text_color(t.ansi2)
+        .tooltip(pushing ? "푸시 중…" : `${name}: 추적 원격 브랜치로 푸시`)
+        .when(!pushing, button => button.cursor_pointer().hover(s => s.bg(t.hover)))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_mouse_up("left", (_e, cx) => cx.stop_propagation())
+        .on_click((_e, cx) => { cx.stop_propagation(); this.push(w, g, cx); })
+        .child(pushing ? "↑…" : `\u2191${g.ahead}`)))
       .when(g.behind > 0, (el) => el.child(div().flex_none().text_color(t.ansi1).child(`\u2193${g.behind}`)));
   }
 
@@ -401,7 +444,7 @@ export default class Spaces extends View {
             .on_mouse_up("left", (_e, cx) => cx.stop_propagation())
             .on_click((_e, cx) => { cx.stop_propagation(); this.toggleWorktrees(group, cx); })
             .child(this.foldedWorktrees.has(group) ? "▶" : "▼")))
-          .child(g ? this.gitTail(g, tree, w.name, t) : div().flex_1())
+          .child(g ? this.gitTail(g, tree, w.name, t, w) : div().flex_1())
           .child(this.statusIndicator(t, status)),
       );
   }

@@ -15,7 +15,7 @@ Apache-2.0 및 각 의존성의 라이선스·저작권을 유지한다.
 | 경로 | 내용 |
 |---|---|
 | `mods/changes-branch/` | 우측 Changes 패널. **Working / 미푸시 / vs main** 전환과 커밋별 변경 조회 |
-| `mods/spaces-foldable/` | 좌측 Spaces 목록. 워크트리를 메인 체크아웃 아래로 접고, git 저장소 공간 아바타 왼쪽에 **+ (새 워크트리)** 버튼 |
+| `mods/spaces-foldable/` | 좌측 Spaces 목록. 프로젝트별 하위 역할 접기, **+ (새 워크트리)**, **↑숫자 클릭 푸시** |
 | `mods/tabs-inline-add/`, `mods/files-utf8/` | 탭 바, Files 패널 복제본 |
 | `layouts/main-worktree-folding.json` | 위 mod들을 쓰는 레이아웃 |
 | `upstream/<버전>/` | 복제 당시 Herdr 기본 mod·레이아웃 원본. 업데이트 후 바뀐 부분을 병합할 때 기준 |
@@ -61,7 +61,9 @@ Herdr 안내(`AGENTS.md`)에 따르면 업데이트는 기본 mod·레이아웃�
 - **미푸시**: 추적 브랜치에 없는 커밋의 메시지·작성 시각을 표시하고, 커밋을 선택하면 해당 커밋의 파일과 상세 차이를 보여준다. `main`에서도 사용할 수 있으며 커밋 전 수정은 섞이지 않는다.
   로컬에 저장된 원격 정보를 기준으로 읽고 자동 fetch/push는 하지 않는다. 원격 미설정·참조 누락·조회 오류를 빈 목록과 구분한다. 최근 100개 커밋을 표시하며 전체 미푸시 수는 탭에 표시한다.
 - 전환: 패널 버튼, 또는 `herdr-app do changes-branch.toggle` (`working` / `branch`).
-  미푸시 탭은 `herdr-app do changes-branch.unpushed`로 열 수 있다. 좌측 `↑숫자`의 동작은 바꾸지 않는다.
+  미푸시 탭은 `herdr-app do changes-branch.unpushed`로 열 수 있다.
+- 좌측 워크스페이스의 **↑숫자**를 클릭하면 해당 브랜치를 추적 원격 브랜치로 즉시 일반 푸시한다. 진행 중은 **↑…**로 표시하고 중복 클릭을 막는다. 결과를 알림으로 표시한 뒤 같은 저장소의 숫자를 갱신한다. **↓숫자**는 받아올 커밋 수 표시다.
+  클릭한 브랜치·저장소가 아직 같은지 확인하며, 원격 이력과 충돌하면 오류를 표시한다. 커밋 전 파일은 그대로 두고 지정된 브랜치 한 곳을 푸시한다.
   `keys.json`에 `"changes-branch:toggle"`을 연결하면 단축키로 쓸 수 있다.
 - 사용 레이아웃 `main-worktree-folding`의 `changes` 블록이 이 mod를 가리킨다.
 
