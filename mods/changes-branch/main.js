@@ -1,7 +1,7 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
 import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, nextCommand } from "herdr";
-import { collectWorking, collectBranch, diffAgainst } from "./git.js";
+import { collectWorking, collectBranch, collectUnpushed, collectCommit, commitDiffArgs, diffAgainst } from "./git.js";
 
 function location() {
   const space = spaces().find((s) => s.active), f = focused();
@@ -16,7 +16,10 @@ const MODE_KEY = "changes.mode";
 const countLines = (text) => text ? text.split("\n").length - Number(text.endsWith("\n")) : 0;
 
 function readMode() {
-  try { return localStorage.getItem(MODE_KEY) === "branch" ? "branch" : "working"; } catch { return "working"; }
+  try {
+    const mode = localStorage.getItem(MODE_KEY);
+    return mode === "branch" || mode === "unpushed" ? mode : "working";
+  } catch { return "working"; }
 }
 
 // Numbers each diff line once, so a frame only draws the rows on screen.
@@ -36,7 +39,7 @@ function diffRows(lines) {
 export default class Changes extends View {
   init(_props, cx) {
     this.files = []; this.rows = []; this.diffWidth = 0; this.message = ""; this.handle = cx.focus_handle();
-    this.mode = readMode(); this.branchInfo = null; this.gen = 0;
+    this.mode = readMode(); this.branchInfo = null; this.unpushed = null; this.selectedCommit = null; this.gen = 0; this.diffGen = 0;
     this.key = () => JSON.stringify({ ...location(), mode: this.mode });
     this.input = InputState.new({ placeholder: "Commit message" });
     this.input.on("change", (_e, cx) => {
@@ -54,7 +57,7 @@ export default class Changes extends View {
       for (;;) {
         const command = await nextCommand();
         if (command === "toggle") this.setMode(this.mode === "branch" ? "working" : "branch", cx);
-        else if (command === "working" || command === "branch") this.setMode(command, cx);
+        else if (command === "working" || command === "branch" || command === "unpushed") this.setMode(command, cx);
       }
     });
   }
@@ -85,6 +88,7 @@ export default class Changes extends View {
     if (this.busy || (this.loading && context === this.context)) return;
     if (context !== this.context) {
       this.context = context; this.root = null; this.files = []; this.open = null; this.branchInfo = null;
+      this.unpushed = null; this.selectedCommit = null; this.diffGen++;
       this.setLines([]); this.error = null; this.note = null; this.closed = false; this.limited = false;
       // A mode switch keeps the draft message and the folder watch; a new folder drops both.
       if (place !== this.place) { this.place = place; this.message = ""; this.input.set_value(""); this.watched = null; }
@@ -99,10 +103,17 @@ export default class Changes extends View {
         if (stale()) return;
         if (top.code !== 0) { this.root = null; this.files = []; this.branchInfo = null; this.setLines([]); this.open = null; this.error = "Not a git repository"; return; }
         const root = top.stdout.trim(), git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
-        const result = this.mode === "branch" ? await collectBranch(git) : await collectWorking(git);
+        let result, history = null, selected = null;
+        if (this.mode === "unpushed") {
+          history = await collectUnpushed(git);
+          if (stale()) return;
+          selected = history.commits.find(c => c.hash === this.selectedCommit)?.hash ?? history.commits[0]?.hash ?? null;
+          result = selected ? await collectCommit(git, selected) : { files: [], hasHead: true, limited: false, branchInfo: null };
+        } else result = this.mode === "branch" ? await collectBranch(git) : await collectWorking(git);
         if (stale()) return;
         this.root = root; this.on = on; this.hasHead = result.hasHead; this.files = result.files; this.limited = result.limited;
-        this.branchInfo = result.branchInfo; this.error = null;
+        if (this.selectedCommit !== selected) { this.open = null; this.closed = false; this.setLines([]); this.diffGen++; }
+        this.unpushed = history; this.selectedCommit = selected; this.branchInfo = result.branchInfo; this.error = null;
         this.watch(root, cx);
         if (this.open && !this.files.some((f) => f.path === this.open)) { this.open = null; this.setLines([]); }
         // The first file's diff shows until you pick another.
@@ -111,7 +122,12 @@ export default class Changes extends View {
           try { await this.load(this.open, context); }
           catch { if (!stale()) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
         }
-      } catch (e) { if (!stale()) this.error = String(e); }
+      } catch (e) {
+        if (!stale()) {
+          this.error = String(e); this.files = []; this.unpushed = null; this.selectedCommit = null;
+          this.open = null; this.branchInfo = null; this.setLines([]); this.diffGen++;
+        }
+      }
       finally { if (gen === this.gen) this.loading = false; cx.notify(); }
     });
   }
@@ -119,6 +135,7 @@ export default class Changes extends View {
   async load(path, context) {
     const file = this.files.find((f) => f.path === path), root = this.root, on = this.on;
     if (!file) return;
+    const selected = this.selectedCommit, gen = ++this.diffGen;
     let lines;
     if (file.fresh || (!this.hasHead && file.status === "A")) {
       const text = await readTextFile(`${root}/${path}`, { on }).catch(() => null);
@@ -129,13 +146,13 @@ export default class Changes extends View {
         lines = [`@@ -0,0 +1,${file.add} @@`, ...text.slice(0, 400000).replace(/\n$/, "").split("\n").slice(0, 1500).map(l => `+${l}`)];
       }
     } else {
-      const against = diffAgainst(this.branchInfo, this.hasHead);
-      const r = await exec("git", [...READ, "diff", ...against, "--no-ext-diff", "--no-textconv", "--no-color", "--", path], { cwd: root, on });
+      const args = selected ? commitDiffArgs(selected) : ["diff", ...diffAgainst(this.branchInfo, this.hasHead)];
+      const r = await exec("git", [...READ, ...args, "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", "--", path], { cwd: root, on });
       if (r.code !== 0) throw new Error(r.stderr);
       const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
       lines = first < 0 ? [file.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
     }
-    if (this.key() === context && this.open === path) this.setLines(lines.slice(0, 1500).map(line => line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line));
+    if (this.key() === context && this.open === path && this.selectedCommit === selected && gen === this.diffGen) this.setLines(lines.slice(0, 1500).map(line => line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line));
   }
 
   setLines(lines) {
@@ -144,7 +161,7 @@ export default class Changes extends View {
   }
 
   pick(path, cx) {
-    this.open = this.open === path ? null : path; this.setLines([]); this.note = null;
+    this.open = this.open === path ? null : path; this.setLines([]); this.note = null; this.diffGen++;
     this.closed = !this.open;
     const context = this.context;
     if (this.open) cx.spawn(async (cx) => {
@@ -152,6 +169,14 @@ export default class Changes extends View {
       catch (e) { if (this.key() === context && this.open === path) this.note = `Cannot preview this diff (too large or unreadable): ${e}`; }
       cx.notify();
     });
+    cx.notify();
+  }
+
+  pickCommit(hash, cx) {
+    if (this.mode !== "unpushed" || hash === this.selectedCommit || !this.unpushed?.commits.some(c => c.hash === hash)) return;
+    this.selectedCommit = hash; this.open = null; this.closed = false; this.files = []; this.setLines([]); this.note = null; this.diffGen++;
+    this.loading = false; // a newer generation supersedes the previous commit's request
+    this.refresh(cx);
     cx.notify();
   }
 
@@ -176,6 +201,7 @@ export default class Changes extends View {
   emptyText() {
     if (this.error) return this.error;
     if (this.loading) return "Loading changes…";
+    if (this.mode === "unpushed") return this.selectedCommit ? "이 커밋에는 파일 변경이 없습니다" : "미푸시 커밋이 없습니다";
     if (!this.root) return "No folder";
     const b = this.branchInfo;
     if (!b) return "No uncommitted changes";
@@ -188,10 +214,23 @@ export default class Changes extends View {
       .bg(this.mode === mode ? t.selected : t.background).text_color(this.mode === mode ? t.foreground : t.muted)
       .hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.setMode(mode, cx)).child(label);
     const b = this.branchInfo;
-    const info = this.mode !== "branch" ? "uncommitted" : b ? `${b.ahead} ahead · ${b.behind} behind ${b.base}` : "";
+    const u = this.unpushed;
+    const info = this.mode === "unpushed" ? (u ? `↑${u.ahead} · ↓${u.behind} · ${u.upstream}` : "") : this.mode !== "branch" ? "uncommitted" : b ? `${b.ahead} ahead · ${b.behind} behind ${b.base}` : "";
     return h_flex().h(34).flex_none().px(10).gap(4).items_center().border_b(1).border_color(t.border)
-      .child(pill("working", "Working")).child(pill("branch", "vs main"))
+      .child(pill("working", "Working")).child(pill("unpushed", u ? `미푸시 · ${u.ahead}` : "미푸시")).child(pill("branch", "vs main"))
       .child(div().flex_1().min_w(0).pl(6).truncate().text_size(11).text_color(t.dim).child(info));
+  }
+
+  commitList(t) {
+    const history = this.unpushed;
+    return v_flex().flex_none()
+      .child(div().px(12).py(4).text_size(10).text_color(t.dim).child("로컬에 저장된 원격 정보 기준 · 자동 fetch 없음"))
+      .when(Boolean(history?.commits.length), el => el.child(v_flex().id("unpushed-commits").flex_none().h(Math.min(156, history.commits.length * 52 + 8)).overflow_y_scrollbar().p(4).border_b(1).border_color(t.border)
+        .children(history.commits.map(c => v_flex().id(`commit-${c.hash}`).h(52).flex_none().px(8).py(4).rounded(6).cursor_pointer()
+          .when(c.hash === this.selectedCommit, e => e.bg(t.selected)).hover(e => e.bg(t.hover)).on_click((_e, cx) => this.pickCommit(c.hash, cx))
+          .child(div().truncate().text_size(12).child(c.subject || "(커밋 메시지 없음)"))
+          .child(div().truncate().text_size(10).text_color(t.dim).child(`${c.hash.slice(0, 8)} · ${c.date.replace("T", " ")}`))))))
+      .when(Boolean(history?.limited), el => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("최근 미푸시 커밋 100개 표시")));
   }
 
   diffRow({ kind, number, text }, t) {
@@ -214,6 +253,7 @@ export default class Changes extends View {
         .child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(`${this.files.length} files`))
         .child(div().flex_1()).child(div().text_size(11).text_color(t.ansi2).child(`+${add}`)).child(div().text_size(11).text_color(t.ansi1).child(`−${del}`)))
       .child(this.modeSwitch(t))
+      .when(this.mode === "unpushed", el => el.child(this.commitList(t)))
       .child(v_flex().id("changes-list").flex_none().h(Math.min(200, Math.max(44, this.files.length * 28 + 12))).overflow_y_scrollbar().p(6).border_b(1).border_color(t.border).children(this.files.map((f) => {
         const parts = f.path.split("/"), name = parts.pop();
         return h_flex().id(`change-${f.path}`).h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer().when(this.open === f.path, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.pick(f.path, cx))

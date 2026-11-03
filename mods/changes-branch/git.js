@@ -4,6 +4,7 @@
 // "vs main" compares against the first of these that exists in the repo.
 export const BASES = ["main", "master", "origin/main", "origin/master"];
 export const MAX_FILES = 1000;
+export const MAX_COMMITS = 100;
 
 const statusOf = (code) => code.includes("U") ? "U" : code.includes("D") ? "D" : code.includes("A") ? "A" : "M";
 
@@ -60,6 +61,49 @@ export async function collectBranch(git) {
     files.push({ path, status: statusOf(parts[i]), fresh: false, ...(stats[path] ?? { add: 0, del: 0 }) });
   }
   return { files: files.slice(0, MAX_FILES), limited: files.length > MAX_FILES, hasHead: true, branchInfo: { branch, base, ahead, behind } };
+}
+
+// Compare the configured tracking ref, using local remote-tracking information only.
+export async function collectUnpushed(git) {
+  const head = await git(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+  if (head.code === 1) throw new Error("브랜치를 선택해야 미푸시 커밋을 볼 수 있습니다 (detached HEAD)");
+  if (head.code !== 0) throw new Error(head.stderr);
+  const branch = head.stdout.trim();
+  const tracking = await git(["for-each-ref", "--format=%(upstream:short)", "--", `refs/heads/${branch}`]);
+  if (tracking.code !== 0) throw new Error(tracking.stderr);
+  const upstream = tracking.stdout.trim();
+  if (!upstream) throw new Error("추적 원격 브랜치 미설정 · 먼저 브랜치의 upstream을 설정하세요");
+  const ref = await git(["rev-parse", "--verify", "--quiet", `${upstream}^{commit}`]);
+  if (ref.code !== 0) throw new Error(`추적 원격 브랜치를 찾을 수 없습니다: ${upstream} · 원격 정보 갱신(fetch)이 필요할 수 있습니다. ${ref.stderr.trim()}`);
+  const counts = await git(["rev-list", "--left-right", "--count", `${upstream}...HEAD`]);
+  if (counts.code !== 0) throw new Error(counts.stderr);
+  const [behind, ahead] = counts.stdout.trim().split(/\s+/).map(Number);
+  const log = await git(["log", "-z", "--format=%H%x00%aI%x00%s", `--max-count=${MAX_COMMITS}`, `${upstream}..HEAD`, "--"]);
+  if (log.code !== 0) throw new Error(log.stderr);
+  const fields = log.stdout.split("\0"), commits = [];
+  for (let i = 0; i + 2 < fields.length; i += 3) {
+    commits.push({ hash: fields[i], date: fields[i + 1], subject: fields[i + 2] });
+  }
+  return { upstream, ahead, behind, commits, limited: ahead > MAX_COMMITS };
+}
+
+// `show` handles root commits and compares merges with their first parent.
+export function commitDiffArgs(hash) {
+  if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(hash)) throw new Error("Invalid commit ID");
+  return ["show", "--format=", "--first-parent", "--diff-merges=first-parent", "--root", hash];
+}
+
+export async function collectCommit(git, hash) {
+  const args = commitDiffArgs(hash);
+  const names = await git([...args, "--name-status", "-z", "--no-renames", "--"]);
+  if (names.code !== 0) throw new Error(names.stderr);
+  const stats = numstats([await git([...args, "--numstat", "-z", "--no-renames", "--"])]);
+  const parts = names.stdout.split("\0").filter(Boolean), files = [];
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    const path = parts[i + 1];
+    files.push({ path, status: statusOf(parts[i]), fresh: false, ...(stats[path] ?? { add: 0, del: 0 }) });
+  }
+  return { files: files.slice(0, MAX_FILES), limited: files.length > MAX_FILES, hasHead: true, branchInfo: null };
 }
 
 // What one file's diff is taken against: the branch base, HEAD, or (no commits yet) the index.
