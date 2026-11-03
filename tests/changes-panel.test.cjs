@@ -86,6 +86,30 @@ test('upstream failures clear previous files and display an error instead of no 
   assert.match(view.emptyText(), /원격 브랜치 미설정/);
 });
 
+test('late failure from a previous commit preview cannot add an error to the new commit', async () => {
+  let fail = false, release, started;
+  const held = new Promise(resolve => { release = resolve; });
+  const ready = new Promise(resolve => { started = resolve; });
+  const mounted = mount('unpushed', {
+    collectCommit: async () => result('same.txt'),
+    exec: async (_cmd, args) => {
+      if (args.includes('--show-toplevel')) return { code: 0, stdout: '/repo\n' };
+      if (args.includes(hashes[0]) && fail) { started(); await held; throw new Error('old preview failed'); }
+      return { code: 0, stdout: '@@ -0,0 +1 @@\n+valid preview\n' };
+    },
+  });
+  await mounted.flush();
+  mounted.view.pick('same.txt', mounted.cx); // close, then reopen the preview
+  fail = true;
+  mounted.view.pick('same.txt', mounted.cx);
+  const previous = mounted.queue.shift()(mounted.cx);
+  await ready;
+  mounted.view.pickCommit(hashes[1], mounted.cx); await mounted.flush();
+  release(); await previous;
+  assert.equal(mounted.view.rows.at(-1).text, 'valid preview');
+  assert.equal(mounted.view.note, null);
+});
+
 test('empty commits remain selectable and successful zero history has a distinct message', async () => {
   const { view, cx, flush, context } = mount('unpushed', { collectCommit: async () => ({ ...result(''), files: [] }) });
   await flush();
