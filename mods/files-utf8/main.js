@@ -1,7 +1,7 @@
 // A lazy file browser with drive/parent navigation and bounded read-only previews.
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Button, Popover, Editor, EditorState } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, appHome } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, appHome, notify } from "herdr";
 
 function location() {
   const space = spaces().find(s => s.active), f = focused();
@@ -50,6 +50,14 @@ async function directory(path, on) {
 
 export default class Files extends View {
   init(_props, cx) {
+    this.doubleClickMs = 500;
+    if (window()?.platform === "windows") cx.spawn(async () => {
+      try {
+        const r = await exec("powershell", ["-NoProfile", "-NonInteractive", "-Command", "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SystemInformation]::DoubleClickTime"]);
+        const ms = Number(r.stdout.trim());
+        if (r.code === 0 && ms >= 1 && ms <= 5000) this.doubleClickMs = ms;
+      } catch { /* Use the Windows default if the setting cannot be read. */ }
+    });
     this.saved = new Map();
     this.drives = []; this.driveMenu = false; this.driveAt = 0; this.driveFocus = cx.focus_handle();
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
@@ -160,6 +168,7 @@ export default class Files extends View {
   }
 
   toggle(path, cx) {
+    this.fileClickTimer?.cancel();
     if (this.folders.has(path)) {
       for (const folder of [...this.folders]) if (folder === path || folder.startsWith(path + "/")) {
         this.folders.delete(folder);
@@ -200,13 +209,34 @@ export default class Files extends View {
     });
   }
 
+  fileClick(path, e, cx) {
+    if (this.on || window()?.platform !== "windows") { this.show(path, cx); return; }
+    this.fileClickTimer?.cancel();
+    if (e.click_count === 2 && this.lastClickedFile === path && this.lastClickedContext === this.context) {
+      this.lastClickedFile = null;
+      const fullPath = `${this.root}/${path}`;
+      cx.spawn(async () => {
+        try {
+          const r = await exec("powershell", ["-NoProfile", "-NonInteractive", "-File", `${appHome()}/mods/files-utf8/open-windows.ps1`, "-Path", fullPath]);
+          if (r.code !== 0) throw new Error(r.stderr || "기본 프로그램을 실행할 수 없습니다");
+        } catch (error) { notify({ title: "파일 열기 실패", body: String(error), level: "error", timeout: 15000 }); }
+      });
+    } else {
+      this.lastClickedFile = path; this.lastClickedContext = this.context;
+      const context = this.context;
+      this.fileClickTimer = cx.timer.after(this.doubleClickMs + 50, cx => {
+        if (this.current(context)) { this.show(path, cx); cx.notify(); }
+      });
+    }
+  }
+
   rows(prefix, depth, out, t) {
     if (out.length >= TOTAL || depth > 40) return out;
     for (const entry of this.entries.get(prefix) ?? []) {
       if (out.length >= TOTAL) break;
       const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[`${this.root}/${path}`];
       out.push(h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
-        .on_click((_e, cx) => entry.dir ? this.toggle(path, cx) : this.show(path, cx))
+        .on_click((e, cx) => entry.dir ? this.toggle(path, cx) : this.fileClick(path, e, cx))
         .child(entry.dir ? svg(`mods/files-utf8/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
         .child(entry.icon ? image(open && entry.openIcon ? entry.openIcon : entry.icon).size(16).flex_none()
           : svg(`mods/files-utf8/${entry.dir ? "folder" : "file"}.svg`).size(14).flex_none().text_color(t.muted))

@@ -75,3 +75,25 @@ test('Windows listing keeps the lazy-browser limit and reports unreadable folder
       assert.ok(result.stderr);
     } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
   });
+
+test('Windows lists OneDrive cloud folders as directories while keeping junctions unexpanded',
+  { skip: process.platform !== 'win32' }, (t) => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'herdr-cloud-folder-'));
+    const link = path.join(temporary, 'cycle');
+    try {
+      fs.symlinkSync(temporary, link, 'junction');
+      const entry = list(temporary, path.join(temporary, 'app')).find(item => item.name === 'cycle');
+      assert.equal(entry.dir, false, 'junction to an ancestor is not traversed');
+      fs.unlinkSync(link);
+      const parent = 'D:/OneDrive/Work/연구개발/제품개발';
+      if (!fs.existsSync(path.join(parent, 'PHM-VB-BT'))) return t.diagnostic('OneDrive project folder unavailable; fixture check completed');
+      const cloud = list(parent, path.join(temporary, 'app')).find(item => item.name === 'PHM-VB-BT');
+      assert.ok(cloud, 'existing project folder is listed');
+      assert.equal(cloud.dir, true, 'cloud reparse directory must expand as a folder');
+      assert.ok(Array.isArray(list(path.join(parent, 'PHM-VB-BT'), path.join(temporary, 'app'))));
+    } finally {
+      if (fs.existsSync(link)) fs.unlinkSync(link);
+      fs.rmSync(temporary, { recursive: true, force: true });
+    }
+    assert.equal(fs.existsSync(temporary), false);
+  });

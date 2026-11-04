@@ -74,7 +74,9 @@ $result = @(foreach ($item in $items) {
     $directory = $item.PSIsContainer
     $entry = @{
         name = $item.Name
-        dir = ($directory -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint))
+        # Cloud-backed directories are also reparse points; only filesystem links
+        # need the existing no-traversal treatment to avoid following cycles.
+        dir = ($directory -and $item.LinkType -notin @('SymbolicLink', 'Junction'))
     }
     if (-not $iconError) {
         try {
