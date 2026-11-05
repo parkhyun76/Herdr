@@ -250,7 +250,11 @@ export default class Spaces extends View {
     const sp = spaces(), ps = panes();
     const ready = (w) => this.shown.has(w.id) || where(w, ps) in this.git || Date.now() - (this.born[w.id] ??= Date.now()) > 1500;
     for (const w of sp) if (!this.shown.has(w.id) && ready(w)) this.shown.add(w.id);
-    const list = sp.map((w, i) => ({ w, i, status: w.status ?? null, g: this.git[where(w, ps)] ?? null })).filter((r) => this.shown.has(r.w.id));
+    const list = sp.map((w, i) => {
+      const tabs = new Set((w.tabs ?? []).map((tab) => tab.id));
+      const working = ps.find((p) => tabs.has(p.tab) && p.status === "working");
+      return { w, i, status: w.status ?? null, agent: working?.program?.key ?? null, g: this.git[where(w, ps)] ?? null };
+    }).filter((r) => this.shown.has(r.w.id));
     const byId = new Map(list.map((r) => [r.w.id, r]));
     const parents = new Map();
     for (const r of list) {
@@ -282,7 +286,9 @@ export default class Spaces extends View {
       parent.group = group;
       if (this.foldedWorktrees.has(group)) {
         // Hidden worktrees still surface the most urgent agent state.
-        parent.status = kids.reduce((top, k) => (STATUS_RANK[k.status] ?? 0) > (STATUS_RANK[top] ?? 0) ? k.status : top, parent.status);
+        const top = kids.reduce((best, k) => (STATUS_RANK[k.status] ?? 0) > (STATUS_RANK[best.status] ?? 0) ? k : best, parent);
+        parent.status = top.status;
+        parent.agent = top.agent;
         continue;
       }
       kids.forEach((k, n) => out.push({ ...k, tree: n === kids.length - 1 ? "└─" : "├─" }));
@@ -359,10 +365,10 @@ export default class Spaces extends View {
       .when(g.behind > 0, (el) => el.child(div().flex_none().text_color(t.ansi1).child(`\u2193${g.behind}`)));
   }
 
-  // Same colors and shapes as the Agents list; a shell-only space stays blank.
-  statusIndicator(t, status) {
+  // A shell-only space stays blank; working agents have distinct colors.
+  statusIndicator(t, status, agent) {
     const slot = h_flex().w(14).h(18).flex_none().items_center().justify_center();
-    if (status === "working") return slot.child(svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.working).spin(900));
+    if (status === "working") return slot.child(svg("mods/workspace-chrome/spinner.svg").size(12).text_color(agent === "codex" ? t.ansi4 : agent === "claude" ? t.working : t.ansi5).spin(900));
     if (status === "blocked") return slot.child(div().size(14).rounded(4).bg(t.blocked + "26").text_size(10.5).font_bold().text_color(t.blocked).flex().items_center().justify_center().child("!"));
     if (status === "done") return slot.child(div().size(7).rounded(4).bg(t.done));
     if (status === "idle") return slot.child(div().size(7).rounded(4).border(1.5).border_color(t.idle ?? t.dim));
@@ -386,7 +392,7 @@ export default class Spaces extends View {
       .child(svg("mods/workspace-chrome/plus.svg").size(12));
   }
 
-  row({ w, i, g, tree, group, status }, t) {
+  row({ w, i, g, tree, group, status, agent }, t) {
     const on = w.active;
     const colors = shared("space.colors") ?? {};
     const color = colors[w.id] ?? "ansi6";
@@ -445,11 +451,11 @@ export default class Spaces extends View {
             .on_click((_e, cx) => { cx.stop_propagation(); this.toggleWorktrees(group, cx); })
             .child(this.foldedWorktrees.has(group) ? "▶" : "▼")))
           .child(g ? this.gitTail(g, tree, w.name, t, w) : div().flex_1())
-          .child(this.statusIndicator(t, status)),
+          .child(this.statusIndicator(t, status, agent)),
       );
   }
 
-  compact({ w, i, status }, t) {
+  compact({ w, i, status, agent }, t) {
     return h_flex()
       .id(`space-${w.id}`)
       .h(26)
@@ -460,7 +466,7 @@ export default class Spaces extends View {
       .hover((s) => s.bg(t.hover))
       .on_click(() => run("space.select", { id: w.id }))
       .child(div().text_color(w.active ? t.foreground : t.muted).child(String(i + 1)))
-      .child(this.statusIndicator(t, status));
+      .child(this.statusIndicator(t, status, agent));
   }
 
   render() {

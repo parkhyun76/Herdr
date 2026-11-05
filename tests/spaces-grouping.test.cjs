@@ -9,9 +9,9 @@ const source = fs.readFileSync(path.join(__dirname, '../mods/spaces-foldable/mai
   .replace('export default class Spaces', 'globalThis.Spaces = class Spaces');
 const space = (id, repo, linked = false, machine = null) => ({ id, name: id, folder: '/' + id, repo, linked, machine, tabs: [{ id: 'tab-' + id }], active: id === 'role' });
 
-function mount(rows, parents = {}, storage = new Map(), sharedStore = new Map()) {
+function mount(rows, parents = {}, storage = new Map(), sharedStore = new Map(), paneRows = []) {
   const context = vm.createContext({
-    View: class {}, spaces: () => rows, panes: () => [],
+    View: class {}, spaces: () => rows, panes: () => paneRows,
     localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
     props: () => ({ parents }), shared: key => sharedStore.get(key), setShared: (key, value) => sharedStore.set(key, value),
     run: () => assert.fail('Grouping must not change terminals, workspaces or files'),
@@ -32,6 +32,38 @@ test('role spaces sharing one checkout stay under their explicit project after r
   const { ordered } = mount(rows, { role: 'master', verify: 'master' });
   assert.deepEqual(ordered().map(row => [row.id, row.nested]), [['other', false], ['master', false], ['role', true], ['verify', true]]);
   assert.equal(JSON.stringify(rows), before, 'IDs, selected space, tabs and paths remain unchanged');
+});
+
+test('working agent colors follow the active pane and the folded status winner', () => {
+  const rows = [space('master', null), space('role', null), space('verify', null)];
+  rows[0].status = 'idle'; rows[1].status = 'working'; rows[2].status = 'working';
+  const panes = [
+    { tab: 'tab-master', status: 'idle', program: { key: 'claude' } },
+    { tab: 'tab-role', status: 'working', program: { key: 'codex' } },
+    { tab: 'tab-verify', status: 'working', program: { key: 'gemini' } },
+  ];
+  const mounted = mount(rows, { role: 'master', verify: 'master' }, new Map(), new Map(), panes);
+  assert.deepEqual(Array.from(mounted.view.ordered(), r => r.agent), [null, 'codex', 'gemini']);
+  mounted.view.toggleWorktrees(mounted.ordered()[0].group, mounted.cx);
+  assert.equal(mounted.view.ordered()[0].agent, 'codex');
+  rows[2].status = 'blocked';
+  assert.equal(mounted.view.ordered()[0].status, 'blocked');
+});
+
+test('working spinner uses blue for Codex, existing orange for Claude, purple otherwise', () => {
+  let color;
+  const element = () => new Proxy({}, { get: (_target, method) => (...args) => {
+    if (method === 'text_color') color = args[0];
+    return element();
+  } });
+  const context = vm.createContext({ View: class {}, h_flex: element, svg: element });
+  vm.runInContext(source, context);
+  const view = new context.Spaces();
+  const theme = { ansi4: '#blue', working: '#orange', ansi5: '#purple' };
+  for (const [agent, expected] of [['codex', '#blue'], ['claude', '#orange'], ['gemini', '#purple'], [null, '#purple']]) {
+    view.statusIndicator(theme, 'working', agent);
+    assert.equal(color, expected);
+  }
 });
 
 test('explicit role groups survive unavailable Git information and restore folded status', () => {

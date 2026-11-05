@@ -15,7 +15,8 @@ Apache-2.0 및 각 의존성의 라이선스·저작권을 유지한다.
 | 경로 | 내용 |
 |---|---|
 | `mods/changes-branch/` | 우측 Changes 패널. **Working / 미푸시 / vs main** 전환과 커밋별 변경 조회 |
-| `mods/spaces-foldable/` | 좌측 Spaces 목록. 프로젝트별 하위 역할 접기, **+ (새 워크트리)**, **↑숫자 클릭 푸시** |
+| `mods/spaces-foldable/` | 좌측 Spaces 목록. 프로젝트별 하위 역할 접기, AI별 작업 색상, **+ (새 워크트리)**, **↑숫자 클릭 푸시** |
+| `mods/agents-colored/` | Agents 목록의 AI별 작업 색상 |
 | `mods/tabs-inline-add/`, `mods/files-utf8/` | 탭 바, Files 패널 복제본 |
 | `layouts/main-worktree-folding.json` | 위 mod들을 쓰는 레이아웃 |
 | `upstream/<버전>/` | 복제 당시 Herdr 기본 mod·레이아웃 원본. 업데이트 후 바뀐 부분을 병합할 때 기준 |
@@ -66,6 +67,7 @@ Herdr 안내(`AGENTS.md`)에 따르면 업데이트는 기본 mod·레이아웃�
   클릭한 브랜치·저장소가 아직 같은지 확인하며, 원격 이력과 충돌하면 오류를 표시한다. 커밋 전 파일은 그대로 두고 지정된 브랜치 한 곳을 푸시한다.
   `keys.json`에 `"changes-branch:toggle"`을 연결하면 단축키로 쓸 수 있다.
 - 사용 레이아웃 `main-worktree-folding`의 `changes` 블록이 이 mod를 가리킨다.
+- Spaces와 Agents의 작업 중 회전 표시는 Codex 파란색, Claude Code 주황색, 그 외 AI 보라색이다. 한 공간에 여러 AI가 작업 중이면 첫 번째 작업 중인 AI의 색상을 표시한다. 접힌 그룹은 기존 상태 우선순위를 적용하며 같은 상태라면 표시 순서대로 선택한다.
 
 ## Files의 Windows 탐색기 아이콘
 
