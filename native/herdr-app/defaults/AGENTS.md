@@ -668,6 +668,8 @@ What's about the user, never a look:
   precedence as fonts.
 - `appearance`: `"light"` or `"dark"` always; absent, the system's. A layout
   with a light and a dark theme shows the matching one.
+- Personal Windows build: the personal status-bar mod shows manual save/restore
+  observation stages. Restore dispatch completion does not mean the AI is ready.
 - Personal Windows build: `session.save` immediately observes and saves exact
   conversation-to-pane bindings; `session.restore` rechecks them and resumes only
   lost AI processes in existing panes. Both return queued before the worker

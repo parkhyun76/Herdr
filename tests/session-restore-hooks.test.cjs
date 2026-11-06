@@ -12,7 +12,7 @@ test('identity hook stores metadata only, rejects invalid/sub-agent IDs, and rec
   const hook = path.resolve(__dirname,'../native/herdr-app/src/session_restore/hook.ps1');
   const sid = randomUUID();
   const file = path.join(base,'Herdr/session-restore/links',`codex-${sid}.json`);
-  const payload = {session_id:sid,hook_event_name:'SessionStart',cwd:base,transcript_path:path.join(base,`${sid}.jsonl`),prompt:'PRIVATE_TEST_TEXT_NOT_TO_STORE'};
+  const payload = {session_id:sid,hook_event_name:'SessionStart',cwd:path.join(base,'한글 경로'),transcript_path:path.join(base,`${sid}.jsonl`),prompt:'PRIVATE_TEST_TEXT_NOT_TO_STORE'};
   const invoke = value => {
     const result=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',hook,'-Agent','codex'],{
       env:{...process.env,LOCALAPPDATA:base,HC_TERMINAL_ID:'hook-test-terminal'},input:JSON.stringify(value),encoding:'utf8',windowsHide:true,timeout:10000,
@@ -27,10 +27,12 @@ test('identity hook stores metadata only, rejects invalid/sub-agent IDs, and rec
     assert.equal(fs.existsSync(file),true,'Run this identity test from a Codex-owned development session');
     let text=fs.readFileSync(file,'utf8'); const record=JSON.parse(text);
     assert.equal(record.session_id,sid); assert.equal(record.ended,false);
+    assert.equal(record.cwd,payload.cwd);
     assert.ok(record.lineage.length>0); assert.equal(text.includes(payload.prompt),false);
     assert.equal(record.terminal_id,'hook-test-terminal');
     invoke({...payload,hook_event_name:'UserPromptSubmit'});
     const refreshed=JSON.parse(fs.readFileSync(file,'utf8'));
+    assert.equal(refreshed.cwd,payload.cwd);
     assert.equal(refreshed.pid,record.pid); assert.deepEqual(refreshed.lineage,record.lineage);
     invoke({...payload,hook_event_name:'SessionEnd',reason:'other'});
     assert.equal(JSON.parse(fs.readFileSync(file,'utf8')).ended,true);

@@ -10,6 +10,24 @@ Node tests: node --test tests/*.test.cjs tests/*.test.mjs (expand file globs on
 older Windows Node versions). Native build instructions are docs/BUILD-WINDOWS.md.
 Never commit auth, diagnostics, transcripts, user settings or build products.
 
+## Commit completed development
+
+After completing development and the required verification, commit the changes
+for that task automatically before reporting completion. Include only the task's
+files and preserve unrelated work. Report the commit ID and verification result.
+Push to GitHub when the user requests it.
+
+## Test temporary files
+
+Use the operating system's temporary directory for test scratch files (on
+Windows, `std::env::temp_dir()` or the equivalent resolves to the user's temp
+directory). Do not use a drive-root path such as `D:\var`. Give each test run a
+uniquely named directory and remove the files and directories it created when
+the test finishes, including on failure where possible. Verify cleanup and
+report any leftovers that could not be removed. Keep explicitly requested test
+evidence or backups separately. Never delete pre-existing or unrelated files,
+or files still in use by another process.
+
 Automatic repair tasks are explicitly authorized to propose narrow UI fixes in
 the private repair worktree. Protect the repair host, dependencies, credentials,
 session restoration, updates and process/network control. Do not weaken tests.

@@ -1,5 +1,6 @@
 param([ValidateSet('codex', 'claude')][string]$Agent)
 $ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 $lease = $null
 try {
     $root = Join-Path $env:LOCALAPPDATA 'Herdr/session-restore/links'

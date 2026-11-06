@@ -2023,11 +2023,21 @@ impl AppWindow {
         for notice in self.session_memory.update(bindings, clean) {
             match notice {
                 crate::session_restore::Notice::Error(error) => {
+                    if let Some(progress) = mods::shared("session.manual-progress")
+                        && progress["step"].as_u64().is_some_and(|step| step < 3)
+                    {
+                        let action = if progress["action"] == "save" { crate::session_restore::ManualAction::Save } else { crate::session_restore::ManualAction::Restore };
+                        crate::session_restore::publish_progress(action, 3, true);
+                    }
                     tracing::warn!("{error}");
                     self.layout_notice("AI 대화 기억", &error, window, cx);
                 }
                 crate::session_restore::Notice::Restore(plan) => self.restore_session(plan, window, cx),
+                crate::session_restore::Notice::ManualProgress(action, step) => {
+                    crate::session_restore::publish_progress(action, step, false);
+                }
                 crate::session_restore::Notice::ManualFinished(action, result) => {
+                    crate::session_restore::publish_progress(action, 3, result.is_err());
                     let title = match action { crate::session_restore::ManualAction::Save => "대화 저장", crate::session_restore::ManualAction::Restore => "대화 복원" };
                     match result {
                         Ok(message) => self.layout_notice(title, &message, window, cx),
@@ -3377,6 +3387,7 @@ impl AppWindow {
                 let action = if name == "session.save" { crate::session_restore::ManualAction::Save } else { crate::session_restore::ManualAction::Restore };
                 let bindings = self.session_bindings();
                 let result = self.session_memory.request(action, bindings, clean);
+                if result.is_ok() { crate::session_restore::publish_progress(action, 0, false); }
                 self.answer(result.map(|_| json!({"queued":true,"action":name})));
             }
             "app.check_updates" => crate::update::check_now(),

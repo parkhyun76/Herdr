@@ -26,7 +26,9 @@ its terminals.
 
 The Windows personal build provides `session.save`, `session.restore`, and
 `session.status`. Save/restore queue an immediate background observation and
-report completion in a notification. Restore reuses living AIs and resumes only
+  report completion in a notification. The personal status-bar mod shows the
+  observation and dispatch stages; restore dispatch completion is not proof the AI
+  is ready. Restore reuses living AIs and resumes only
 lost conversations in existing panes; closed panes stay closed. The tab bar's
 conversation button left of Files opens the same two actions. Automatic memory
 continues. Versions marked `-personal.*` block official app executable updates

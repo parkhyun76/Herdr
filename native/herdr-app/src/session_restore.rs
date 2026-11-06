@@ -62,10 +62,19 @@ pub struct Plan {
 pub enum Notice {
     Restore(Plan),
     Error(String),
+    ManualProgress(ManualAction, u8),
     ManualFinished(ManualAction, Result<String, String>),
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ManualAction { Save, Restore }
+
+// Called on the window thread. Completed states expire in the status bar.
+pub fn publish_progress(action: ManualAction, step: u8, failed: bool) {
+    crate::mods::set_shared("session.manual-progress".into(), serde_json::json!({
+        "action": if action == ManualAction::Save { "save" } else { "restore" },
+        "step": step, "failed": failed, "updated_ms": now(),
+    }));
+}
 
 enum Message {
     Frame(Vec<Binding>, bool),
@@ -206,6 +215,10 @@ impl Drop for Manager {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn scan_due(last_scan: Option<Instant>) -> bool {
+    last_scan.is_none_or(|t| t.elapsed() >= Duration::from_secs(300))
 }
 
 fn now() -> u64 {
@@ -499,7 +512,7 @@ fn worker(
     let mut can_restore = false;
     let mut written = String::new();
     let mut last_error = String::new();
-    let mut last_scan = Instant::now() - Duration::from_secs(300);
+    let mut last_scan: Option<Instant> = None;
     let mut last_trigger = String::new();
     loop {
         let message = match input.recv_timeout(Duration::from_secs(300)) {
@@ -538,6 +551,7 @@ fn worker(
         }
         let action = manual.as_ref().map(|(action, _, _)| *action);
         if let Some((action, bindings, ready)) = manual {
+            let _ = output.send(Notice::ManualProgress(action, 1));
             frames = bindings;
             can_restore = ready && action == ManualAction::Restore;
             if ready { prepare_manual(&mut store, &frames, action); }
@@ -562,13 +576,14 @@ fn worker(
         if !frames.is_empty()
             && (action.is_some() || stop.is_some()
                 || trigger != last_trigger
-                || last_scan.elapsed() >= Duration::from_secs(300))
+                || scan_due(last_scan))
         {
-            last_scan = Instant::now();
+            last_scan = Some(Instant::now());
             last_trigger = trigger;
             match scan(&frames) {
                 Ok(scan) => {
                     last_error.clear();
+                    if let Some(action) = action { let _ = output.send(Notice::ManualProgress(action, 2)); }
                     for plan in observe(
                         &mut store,
                         &frames,
@@ -950,6 +965,11 @@ pub fn launch(core: &crate::hc::Core, plan: &Plan) -> Result<(String, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn initial_scan_is_due_without_subtracting_from_system_uptime() {
+        assert!(scan_due(None));
+        assert!(!scan_due(Some(Instant::now())));
+    }
     fn binding() -> Binding {
         Binding {
             space: "s".into(),
@@ -1047,6 +1067,9 @@ mod tests {
         assert!(manager.request(ManualAction::Save, vec![], true).is_ok());
         assert!(manager.request(ManualAction::Restore, vec![], true).is_err());
         assert!(matches!(input.try_recv().unwrap(), Message::Manual(ManualAction::Save, _, true)));
+        output.send(Notice::ManualProgress(ManualAction::Save, 1)).unwrap();
+        assert_eq!(manager.update(vec![], true).len(), 1);
+        assert!(manager.request(ManualAction::Restore, vec![], true).is_err());
         output.send(Notice::ManualFinished(ManualAction::Save, Ok("saved".into()))).unwrap();
         assert_eq!(manager.update(vec![], true).len(), 1);
         assert!(manager.request(ManualAction::Restore, vec![], true).is_ok());
