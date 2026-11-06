@@ -1,0 +1,43 @@
+Herdr Personal — Windows x64 개인 개선판
+
+설치
+1. Herdr-Personal-...-Setup.exe를 실행하고 설치를 진행합니다. 관리자 권한은 필요 없습니다.
+2. 기존 Herdr 창이 있다면 창만 정상 종료합니다. core/AI 프로세스는 그대로 둡니다.
+3. 처음 실행할 때 core가 없다면 Herdr 화면에서 "Install it for me"를 선택합니다.
+   core 다운로드에는 인터넷이 필요합니다.
+4. Git, Codex, Claude Code는 필요한 도구만 각자 설치하고 본인 계정으로 로그인합니다.
+5. 프로젝트 폴더를 워크스페이스로 추가합니다.
+Windows 10 1809 이상 x64가 대상이며 필요한 Visual C++ 런타임 DLL도 포함합니다.
+
+포함 기능
+- 워크스페이스 그룹/워크트리 추가, AI별 작업 색상, Agents 색상
+- Windows Files 아이콘, OneDrive 폴더, 더블클릭 기본 프로그램 열기
+- 대화 저장·복원 및 하단 진행 막대
+- Windows 이미지 붙여넣기, 텍스트 선택 복사, 개인 개선판 업데이트 보호
+
+대화 연결
+설치 시 "대화 복원 연결 등록"을 선택하면 이미 설정된 AI의 연결 훅을 추가합니다.
+기존 훅과 설정은 보존하고 덮어쓰는 파일을 별도 백업합니다.
+Codex에서 새 훅의 실행 승인을 요청하면 Herdr session-restore/hook.ps1 항목을 확인하고
+승인해야 합니다. 승인 전에는 정확한 새 대화 연결을 수집하지 못할 수 있습니다.
+기존 대화는 메시지 전송 또는 다음 AI 실행 이후 연결 정보가 기록됩니다.
+AI를 나중에 설치했다면 Herdr 창을 닫고 설치 폴더에서 다음을 실행합니다.
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Initialize-HerdrPersonal.ps1 -AppDir . -EnableAI
+다른 PC의 대화 기록을 가져오는 기능은 아닙니다. 각 PC의 대화를 저장·복원합니다.
+
+위치와 복구
+앱: %LOCALAPPDATA%\Programs\herdr-app
+화면: %USERPROFILE%\.config\herdr-app (HERDR_APP_HOME / XDG_CONFIG_HOME 설정 시 해당 경로)
+연결: %LOCALAPPDATA%\Herdr
+이전 설정 백업: %LOCALAPPDATA%\herdr-app-backups\personal-setup-...
+기존 화면/훅의 변경 파일만 백업합니다. 기존 실행 파일이 필요하면 설치 전에 따로 보관하세요.
+설치 프로그램 제거는 화면 사용자 설정, 대화 연결, AI 훅, core를 삭제하지 않습니다.
+설치 후 터미널에서 herdr-app 명령을 쓰려면 앱 폴더를 사용자 PATH에 추가하세요.
+자동 소스 수정 작업자는 이 패키지에서 활성화하지 않습니다.
+
+배포 정보
+개인 계정, 인증 토큰, 대화 기록, 원래 PC의 프로젝트/워크스페이스 설정은 포함하지 않습니다.
+공식 앱 자동 교체는 개인 기능 보호를 위해 차단됩니다. 개인 설치 파일로 업데이트합니다.
+코드 서명 인증서가 없는 개인 빌드입니다. 출처와 함께 제공된 SHA256을 확인하세요.
+소스: https://github.com/parkhyun76/Herdr
+원본 및 의존성의 라이선스는 LICENSE와 THIRD-PARTY-NOTICES를 확인하세요.

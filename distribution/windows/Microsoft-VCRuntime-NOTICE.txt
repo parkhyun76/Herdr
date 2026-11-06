@@ -1,0 +1,14 @@
+Microsoft Visual C++ Runtime
+
+vcruntime140.dll is an unmodified x64 redistributable from Visual Studio 2022.
+Copyright Microsoft Corporation. All rights reserved.
+It is supplied under the Microsoft Visual Studio Distributable Code terms,
+not under Herdr's Apache-2.0 license.
+
+Redistribution list and terms reference:
+https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution
+Visual Studio license terms:
+https://visualstudio.microsoft.com/license-terms/
+
+This DLL is deployed only in the application's directory. Update this personal
+package when a newer Visual C++ runtime is required.
