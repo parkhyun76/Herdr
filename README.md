@@ -5,6 +5,14 @@ Herdr Windows 개인 개선판의 전체 앱 소스와 사용자 mod를 관리�
 Apache-2.0 및 각 의존성의 라이선스·저작권을 유지한다.
 전체 native 소스는 `native/herdr-app/`, 사용자 UI는 `mods/`에 있다.
 [Windows 빌드·설치](docs/BUILD-WINDOWS.md) · [오류 기록·자동 개선](docs/DIAGNOSTICS.md)
+· [Jev 전역 연동·설치·검증](docs/JEV-INTEGRATION.md)
+
+Jev 연동은 Herdr의 Claude Code·Codex 요청을 자동 분류하고 현재 AI에 짧은
+참고 문맥을 전달한다. 기존·신규 프로젝트 모두 사용자 전역 훅을 사용하며,
+하단 **Jev** 표시를 클릭하면 현재 대화의 최근 호출 결과를 볼 수 있다.
+설치는 `node scripts/install-jev.cjs`, 키 입력은 `scripts/jev/set-key.ps1`을
+사용한다. 기존 모델·권한·세션 복원 훅을 유지하며 실패 시 기본 작업을 계속한다.
+현재 요청과 제한된 최근 문맥이 TypeSafe API로 전송된다.
 
 동료에게 전달할 Windows 설치 파일은 `scripts/build-distribution.ps1`로 만든다.
 결과는 `dist/Herdr-Personal-<버전>-Setup.exe`이며, 설치·재생성 방법은

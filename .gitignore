@@ -13,6 +13,13 @@ build-tools/
 **/session-restore.json*
 **/session-restore/links/
 **/auto-repair.json
+**/credential.dpapi
+scripts/jev/runtime.json
+scripts/jev/config.json
+scripts/jev/probe.json
+scripts/jev/health/
+scripts/jev/terminals/
+scripts/jev/locks/
 *.log
 *.exe
 *.pdb

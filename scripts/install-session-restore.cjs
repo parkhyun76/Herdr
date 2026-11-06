@@ -101,5 +101,5 @@ async function main() {
     console.log(JSON.stringify({ backup, codexHooks: own.map(h => ({ event: h.eventName, trusted: h.trustStatus })), claudeHooks: 4 }));
   } finally { client.close(); }
 }
-module.exports = { addHooks };
+module.exports = { addHooks, rpc };
 if (require.main === module) main().catch(error => { console.error(error.message); process.exitCode = 1; });

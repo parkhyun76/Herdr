@@ -1,10 +1,35 @@
 import { View, div, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, agents, theme, run, window, keys, shared } from "herdr";
+import { spaces, agents, theme, run, window, keys, shared, focused, readTextFile, appHome, setShared } from "herdr";
+import { readStatus, descriptions } from "./jev.js";
 
 export default class WorkspaceStatus extends View {
   init(_props, cx) {
-    cx.timer.every(1000, cx => cx.notify());
+    this.refreshJev(cx);
+    cx.timer.every(1000, cx => { this.refreshJev(cx); cx.notify(); });
+  }
+
+  refreshJev(cx) {
+    const terminal = focused()?.terminal;
+    if (this.jevTerminal !== terminal) {
+      this.jevTerminal = terminal;
+      this.jevAt = 0;
+      setShared("jev.current", { terminal, status: "loading", label: descriptions.loading });
+    }
+    if (window()?.platform !== "windows" || !/^t[a-z0-9]{1,30}$/.test(terminal ?? "")) {
+      setShared("jev.current", { terminal, status: "unsupported", label: descriptions.unsupported });
+      return;
+    }
+    if (this.jevPending || Date.now() - (this.jevAt ?? 0) < 2000) return;
+    this.jevPending = true;
+    cx.spawn(async cx => {
+      try {
+        const state = await readStatus(readTextFile, appHome(), terminal);
+        if (focused()?.terminal === terminal) setShared("jev.current", { ...state, terminal });
+      } catch {
+        if (focused()?.terminal === terminal) setShared("jev.current", { terminal, status: "unavailable", label: descriptions.unavailable });
+      } finally { this.jevPending = false; this.jevAt = Date.now(); cx.notify(); }
+    });
   }
 
   progress(t) {
@@ -36,6 +61,7 @@ export default class WorkspaceStatus extends View {
     const list = agents();
     const needs = list.filter(a => a.status === "blocked").length;
     const progress = this.progress(t);
+    const jev = shared("jev.current");
     const label = (icon, text) => h_flex().gap(6).items_center().child(svg(`mods/workspace-chrome/${icon}.svg`).size(13)).child(text);
     return h_flex().size_full().px(14).gap(16).items_center().bg(t.chrome).border_t(1).border_color(t.border).text_size(11.8).text_color(t.muted)
       .child(label(space?.machine ? "server" : "monitor", space?.machine ?? "This computer"))
@@ -43,6 +69,11 @@ export default class WorkspaceStatus extends View {
       .child(h_flex().gap(6).items_center().child(div().size(6).rounded(3).bg(t.dim)).child(`${list.length} agents`)
         .when(needs > 0, el => el.child(div().text_color(t.blocked).child(`· ${needs} needs you`))))
       .child(div().flex_1())
+      .when(window()?.platform === "windows", el => el.child(div().id("jev-status-button").flex_none()
+        .text_color(jev?.status === "applied" ? t.done : t.muted)
+        .tooltip("현재 대화의 최근 Jev 호출 결과 보기")
+        .on_click(() => run("mod.open", { name: "jev-status" }))
+        .child(`Jev · ${jev?.label ?? "호출 확인 전"}`)))
       .when(Boolean(progress), el => el.child(progress))
       .child(div().id("palette").text_color(t.dim).on_click(() => run("app.palette")).child(this.hint(t)));
   }
