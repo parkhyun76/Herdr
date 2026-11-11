@@ -96,6 +96,8 @@ pub struct TerminalView {
     link: Option<LinkTarget>,
     /// Right-clicks go to the program when it takes the mouse (Shift: the menu).
     pub right_click_to_program: bool,
+    /// Image shortcut for the program identified by the core's current facts.
+    pub image_paste_key: &'static str,
     grid: Rc<RefCell<Grid>>,
     focus: FocusHandle,
     was_focused: bool,
@@ -192,6 +194,7 @@ impl TerminalView {
             cwd: None,
             link: None,
             right_click_to_program: false,
+            image_paste_key: "ctrl-v",
             grid: Rc::new(RefCell::new(Grid {
                 vt: Vt::new(size_hint.0.max(2), size_hint.1.max(1)),
                 core: core.clone(),
@@ -523,7 +526,7 @@ impl TerminalView {
             cx.emit(TerminalEvent::ClipboardError("클립보드에 읽을 수 있는 이미지나 텍스트가 없습니다. 캡처 후 다시 시도하세요.".into()));
             return;
         }
-        let bytes = paste_image_fallback(&mut self.grid.borrow_mut().vt, text.as_deref());
+        let bytes = paste_image_fallback(&mut self.grid.borrow_mut().vt, text.as_deref(), self.image_paste_key);
         if let Some(bytes) = bytes {
             self.send(&bytes);
         }
@@ -578,7 +581,7 @@ impl TerminalView {
             }).await;
             let _ = this.update(cx, |this, cx| match result {
                 Ok(()) => {
-                    let bytes = paste_image_fallback(&mut this.grid.borrow_mut().vt, None);
+                    let bytes = paste_image_fallback(&mut this.grid.borrow_mut().vt, None, this.image_paste_key);
                     if let Some(bytes) = bytes { this.send(&bytes); }
                 }
                 Err(error) => {
@@ -988,12 +991,17 @@ fn fallback_icon(text: &str, font: &Font, ts: &gpui::TextSystem) -> Option<IconG
     icon_glyph(c)
 }
 
-fn paste_image_fallback(vt: &mut vt::Vt, text: Option<&str>) -> Option<Vec<u8>> {
+pub fn image_paste_key(windows: bool, program: Option<&str>) -> &'static str {
+    // Native Windows Claude Code binds image paste to Alt+V; Codex uses Ctrl+V.
+    if windows && program == Some("claude") { "alt-v" } else { "ctrl-v" }
+}
+
+fn paste_image_fallback(vt: &mut vt::Vt, text: Option<&str>, key: &str) -> Option<Vec<u8>> {
     // Windows console programs expect the terminal to paste clipboard text.
     if cfg!(windows) && let Some(text) = text {
         return Some(vt.paste_bytes(text));
     }
-    let keystroke = Keystroke::parse("ctrl-v").ok()?;
+    let keystroke = Keystroke::parse(key).ok()?;
     key_bytes(vt, &KeyDownEvent { keystroke, is_held: false, prefer_character_input: false })
 }
 
@@ -1967,12 +1975,33 @@ mod tests {
     #[test]
     fn ctrl_v_clipboard_text_follows_platform_paste_convention() {
         let mut vt = Vt::new(20, 3);
-        assert_eq!(super::paste_image_fallback(&mut vt, None).unwrap(), b"\x16");
+        assert_eq!(super::paste_image_fallback(&mut vt, None, "ctrl-v").unwrap(), b"\x16");
         for bracketed in [false, true] {
             vt.write(if bracketed { b"\x1b[?2004h" } else { b"\x1b[?2004l" });
-            let bytes = super::paste_image_fallback(&mut vt, Some("paste-probe")).unwrap();
-            let expected = if cfg!(windows) { vt.paste_bytes("paste-probe") } else { vec![0x16] };
-            assert_eq!(bytes, expected);
+            for key in ["ctrl-v", "alt-v"] {
+                let bytes = super::paste_image_fallback(&mut vt, Some("paste-probe"), key).unwrap();
+                let expected = if cfg!(windows) { vt.paste_bytes("paste-probe") } else { key_bytes(&mut vt, &press(key, None)).unwrap() };
+                assert_eq!(bytes, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn image_paste_uses_the_program_shortcut_in_each_keyboard_mode() {
+        for windows in [false, true] {
+            for program in [Some("claude"), Some("codex"), Some("shell"), None] {
+                let key = super::image_paste_key(windows, program);
+                let alt = windows && program == Some("claude");
+                assert_eq!(key, if alt { "alt-v" } else { "ctrl-v" });
+                for mode in [b"".as_slice(), b"\x1b[?9001h", b"\x1b[>1u"] {
+                    let mut vt = Vt::new(20, 3);
+                    vt.write(mode);
+                    let expected: &[u8] = if mode == b"\x1b[>1u" {
+                        if alt { b"\x1b[118;3u" } else { b"\x1b[118;5u" }
+                    } else if alt { b"\x1bv" } else { b"\x16" };
+                    assert_eq!(super::paste_image_fallback(&mut vt, None, key).unwrap(), expected);
+                }
+            }
         }
     }
 

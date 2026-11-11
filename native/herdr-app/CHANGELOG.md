@@ -1,5 +1,10 @@
 # Herdr changelog
 
+## [0.1.12-personal.3] - 2026-11-11
+
+### Fixed
+- Windows screenshot paste now sends Claude Code its Alt+V shortcut while preserving Codex's Ctrl+V image attachment.
+
 ## [0.1.12-personal.2] - 2026-11-03
 
 ### Fixed

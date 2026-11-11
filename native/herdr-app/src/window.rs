@@ -1927,13 +1927,15 @@ impl AppWindow {
 
     // ---- core facts --------------------------------------------------------
 
-    /// What a terminal view takes from the core's facts: its folder, where right-clicks go.
+    /// What a terminal view takes from the core's facts: folder, mouse and image keys.
     fn tell_term(&self, view: &Entity<TerminalView>, addr: &str, cx: &mut Context<Self>) {
         let cwd = self.cwds.get(addr).map(std::path::PathBuf::from);
         let to_program = self.live.get(addr).and_then(|r| r.pointer("/labels/herdr.right-click")).and_then(Value::as_str) == Some("program");
+        let program = self.live.get(addr).and_then(|r| r.pointer("/program/key")).and_then(Value::as_str);
         view.update(cx, |v, _| {
             v.cwd = cwd;
             v.right_click_to_program = to_program;
+            v.image_paste_key = crate::terminal::image_paste_key(cfg!(windows), program);
         });
     }
 
@@ -5001,6 +5003,19 @@ fn changed_asset_paths(home: &std::path::Path, changed: &[std::path::PathBuf]) -
 mod tests {
     use gpui::{div, point, px, size, Context, IntoElement, Render, TestAppContext, Window};
     use gpui::prelude::*;
+
+    #[test]
+    fn image_paste_key_follows_core_program_identity() {
+        for (report, argv, expected) in [
+            (serde_json::json!({"app":"claude-code"}), serde_json::json!(["pwsh.exe"]), "alt-v"),
+            (serde_json::json!({}), serde_json::json!(["claude.exe"]), "alt-v"),
+            (serde_json::json!({"app":"codex"}), serde_json::json!(["pwsh.exe"]), "ctrl-v"),
+            (serde_json::json!({}), serde_json::json!(["pwsh.exe"]), "ctrl-v"),
+        ] {
+            let program = super::program_of(&report, Some(&argv));
+            assert_eq!(crate::terminal::image_paste_key(true, program["key"].as_str()), expected);
+        }
+    }
 
     #[test]
     fn going_back_into_a_split_column_takes_its_top_pane_whatever_the_fractions() {

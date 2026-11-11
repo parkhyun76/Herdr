@@ -41,7 +41,8 @@ Windows drag selections copy automatically. Ctrl+C with a selection copies
 locally instead of interrupting the AI; click elsewhere or press Esc to clear
 the selection before using Ctrl+C as an interrupt. Alt+V and Ctrl+V read images
 in the GUI session and bridge them to the AI terminal's Windows clipboard before
-sending the image key, so service-session agents work. Remote images use file upload.
+sending Alt+V to Claude Code or Ctrl+V to other programs, so service-session agents
+work. Remote images use file upload.
 
 For programs that cached the wrong input background, `settings.json` accepts
 `terminal_background_overrides`, an optional map of exact `#rrggbb` background
