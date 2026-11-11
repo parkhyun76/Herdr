@@ -245,7 +245,8 @@ export default class Spaces extends View {
     setShared("spaces-foldable.folds", { machines: [...this.folded], worktrees: [...this.foldedWorktrees] });
   }
 
-  // Explicit role groups survive sharing one checkout; Git worktrees still group automatically.
+  // Explicit groups nest level under level (a business, its projects, their roles)
+  // and survive sharing one checkout; Git worktrees still group automatically.
   ordered() {
     const sp = spaces(), ps = panes();
     const ready = (w) => this.shown.has(w.id) || where(w, ps) in this.git || Date.now() - (this.born[w.id] ??= Date.now()) > 1500;
@@ -256,43 +257,55 @@ export default class Spaces extends View {
       return { w, i, status: w.status ?? null, agent: working?.program?.key ?? null, g: this.git[where(w, ps)] ?? null };
     }).filter((r) => this.shown.has(r.w.id));
     const byId = new Map(list.map((r) => [r.w.id, r]));
-    const parents = new Map();
-    for (const r of list) {
+    const explicitOf = (r) => {
       const parent = byId.get(this.parents[r.w.id]);
-      if (parent && parent !== r && !this.parents[parent.w.id] && (parent.w.machine ?? null) === (r.w.machine ?? null)) parents.set(r.w.id, parent.w.id);
-    }
-    const mains = new Map();
-    for (const r of list) if (r.g && !r.g.linked && !parents.has(r.w.id) && !mains.has(r.g.repo)) mains.set(r.g.repo, r.w.id);
-    const parentOf = (r) => {
-      const explicit = parents.get(r.w.id);
-      if (!explicit) return r.g?.linked ? mains.get(r.g.repo) : null;
-      const parent = byId.get(explicit);
-      return (parent.g?.linked && mains.get(parent.g.repo)) || explicit;
+      return parent && parent !== r && (parent.w.machine ?? null) === (r.w.machine ?? null) ? parent : null;
     };
-    const out = [];
+    // A repo's main checkout: not a worktree, nor a role placed inside its own project.
+    const mains = new Map();
     for (const r of list) {
-      if (parentOf(r)) continue;
-      const parent = { ...r, tree: null };
-      out.push(parent);
-      const kids = list.filter((k) => parentOf(k) === r.w.id);
-      if (!kids.length) continue;
-      const explicit = kids.some((k) => parents.has(k.w.id));
+      const up = explicitOf(r);
+      if (r.g && !r.g.linked && up?.g?.repo !== r.g.repo && !mains.has(r.g.repo)) mains.set(r.g.repo, r);
+    }
+    const parentOf = new Map();
+    for (const r of list) {
+      const up = explicitOf(r) ?? (r.g?.linked ? mains.get(r.g.repo) : null);
+      if (up && up !== r) parentOf.set(r, up);
+    }
+    // Declarations that loop would hide each other: those spaces stay on top.
+    const looped = list.filter((r) => {
+      let up = parentOf.get(r);
+      for (let n = 0; up && n < list.length; n++, up = parentOf.get(up)) if (up === r) return true;
+      return false;
+    });
+    for (const r of looped) parentOf.delete(r);
+    const kids = new Map();
+    for (const r of list) if (parentOf.has(r)) kids.set(parentOf.get(r), [...(kids.get(parentOf.get(r)) ?? []), r]);
+    const below = (r) => (kids.get(r) ?? []).flatMap((k) => [k, ...below(k)]);
+    const out = [];
+    const emit = (r, depth, tree) => {
+      const row = { ...r, depth, tree };
+      out.push(row);
+      const mine = kids.get(r);
+      if (!mine) return;
+      const explicit = mine.some((k) => explicitOf(k) === r);
       const group = explicit ? JSON.stringify([r.w.machine ?? null, "space", r.w.id]) : r.g?.repo;
       if (explicit && r.g?.repo && this.foldedWorktrees.has(r.g.repo)) {
         this.foldedWorktrees.delete(r.g.repo);
         this.foldedWorktrees.add(group);
         this.saveFolds();
       }
-      parent.group = group;
+      row.group = group;
       if (this.foldedWorktrees.has(group)) {
-        // Hidden worktrees still surface the most urgent agent state.
-        const top = kids.reduce((best, k) => (STATUS_RANK[k.status] ?? 0) > (STATUS_RANK[best.status] ?? 0) ? k : best, parent);
-        parent.status = top.status;
-        parent.agent = top.agent;
-        continue;
+        // Hidden levels still surface the most urgent agent state.
+        const top = below(r).reduce((best, k) => (STATUS_RANK[k.status] ?? 0) > (STATUS_RANK[best.status] ?? 0) ? k : best, row);
+        row.status = top.status;
+        row.agent = top.agent;
+        return;
       }
-      kids.forEach((k, n) => out.push({ ...k, tree: n === kids.length - 1 ? "└─" : "├─" }));
-    }
+      mine.forEach((k, n) => emit(k, depth + 1, n === mine.length - 1 ? "└─" : "├─"));
+    };
+    for (const r of list) if (!parentOf.has(r)) emit(r, 0, null);
     return out;
   }
 
@@ -392,7 +405,7 @@ export default class Spaces extends View {
       .child(svg("mods/workspace-chrome/plus.svg").size(12));
   }
 
-  row({ w, i, g, tree, group, status, agent }, t) {
+  row({ w, i, g, tree, depth, group, status, agent }, t) {
     const on = w.active;
     const colors = shared("space.colors") ?? {};
     const color = colors[w.id] ?? "ansi6";
@@ -440,7 +453,7 @@ export default class Spaces extends View {
           .gap(9)
           .items_center()
           .child(this.worktreeAdd(w, g && !tree, t))
-          .when(Boolean(tree), el => el.pl(22).child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(t.dim)))
+          .when(Boolean(tree), el => el.pl(22 * depth).child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(t.dim)))
           .when(!tree, el => el.child(h_flex().size(18).flex_none().rounded(5).bg(fill).items_center().justify_center().text_size(10.5).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
           .child(div().min_w(0).flex_shrink(1).max_w(150).truncate().text_color(t.foreground).child(w.name))
           .when(Boolean(group), el => el.child(div().id(`worktrees-toggle-${w.id}`).w(20).h(22).flex_none()

@@ -22,7 +22,7 @@ function mount(rows, parents = {}, storage = new Map(), sharedStore = new Map(),
   view.init(undefined, cx);
   for (const row of rows) view.git[JSON.stringify([row.machine, row.folder])] = row.repo
     ? { repo: JSON.stringify([row.machine, row.repo]), linked: row.linked } : null;
-  const ordered = () => Array.from(view.ordered(), row => ({ id: row.w.id, nested: Boolean(row.tree), group: row.group, status: row.status }));
+  const ordered = () => Array.from(view.ordered(), row => ({ id: row.w.id, nested: Boolean(row.tree), depth: row.depth, group: row.group, status: row.status }));
   return { view, cx, ordered, storage, sharedStore };
 }
 
@@ -113,6 +113,36 @@ test('role fold identity survives Git discovery and migrates the existing projec
   assert.deepEqual(migrated.ordered().map(row => row.id), ['master']);
   migrated.view.toggleWorktrees(initialGroup, migrated.cx);
   assert.deepEqual(migrated.ordered().map(row => row.id), ['master', 'role']);
+});
+
+test('a business group nests projects that keep their own role spaces', () => {
+  const rows = [space('bt-fw', '/bt/.git'), space('bt', '/bt/.git'), space('factory', '/work/.git'), space('mb', '/mb/.git'), space('mb-ee', '/mb/.git'), space('other', null)];
+  const before = JSON.stringify(rows);
+  const { ordered } = mount(rows, { bt: 'factory', mb: 'factory', 'bt-fw': 'bt', 'mb-ee': 'mb' });
+  assert.deepEqual(ordered().map(row => [row.id, row.depth]), [['factory', 0], ['bt', 1], ['bt-fw', 2], ['mb', 1], ['mb-ee', 2], ['other', 0]]);
+  assert.equal(JSON.stringify(rows), before, 'IDs, selected space, tabs and paths remain unchanged');
+});
+
+test('folding a business group hides every level and surfaces the most urgent grandchild', () => {
+  const rows = [space('factory', null), space('bt', null), space('bt-fw', null), space('mb', null)];
+  rows[0].status = 'idle'; rows[1].status = 'idle'; rows[2].status = 'blocked'; rows[3].status = 'working';
+  const mounted = mount(rows, { bt: 'factory', mb: 'factory', 'bt-fw': 'bt' });
+  mounted.view.toggleWorktrees(mounted.ordered()[1].group, mounted.cx);
+  assert.deepEqual(mounted.ordered().map(row => [row.id, row.status]), [['factory', 'idle'], ['bt', 'blocked'], ['mb', 'working']]);
+  mounted.view.toggleWorktrees(mounted.ordered()[0].group, mounted.cx);
+  assert.deepEqual(mounted.ordered().map(row => [row.id, row.status]), [['factory', 'blocked']]);
+});
+
+test('a project under a business group still gathers its automatic Git worktrees', () => {
+  const rows = [space('factory', null), space('mb', '/mb/.git'), space('mb-role', '/mb/.git'), space('mb-me', '/mb/.git', true)];
+  const { ordered } = mount(rows, { mb: 'factory', 'mb-role': 'mb' });
+  assert.deepEqual(ordered().map(row => [row.id, row.depth]), [['factory', 0], ['mb', 1], ['mb-role', 2], ['mb-me', 2]]);
+});
+
+test('longer parent cycles never hide spaces while a space pointing into them stays nested', () => {
+  const rows = [space('a', null), space('b', null), space('c', null), space('d', null)];
+  const { ordered } = mount(rows, { a: 'b', b: 'c', c: 'a', d: 'a' });
+  assert.deepEqual(ordered().map(row => [row.id, row.depth]), [['a', 0], ['d', 1], ['b', 0], ['c', 0]]);
 });
 
 test('changing native layout props preserves legacy folds despite a new localStorage namespace', () => {
