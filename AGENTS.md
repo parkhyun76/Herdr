@@ -10,6 +10,15 @@ Node tests: node --test tests/*.test.cjs tests/*.test.mjs (expand file globs on
 older Windows Node versions). Native build instructions are docs/BUILD-WINDOWS.md.
 Never commit auth, diagnostics, transcripts, user settings or build products.
 
+## Local Windows maintenance assets
+
+Read `.local/HERDR-WINDOWS-IMPROVEMENTS.md` before Windows app maintenance and
+update that same record afterward. Cached source, build tools and historical
+evidence live in `.local/herdr-customization/`; all of `.local/` stays out of Git.
+See `docs/LOCAL-HERDR-ASSETS.md` for current paths and verification.
+In a private repair worktree, resolve `.local/` against `auto-repair.json`'s
+`repository` directory; the local assets are not copied into repair worktrees.
+
 ## Commit completed development
 
 After completing development and the required verification, commit the changes

@@ -44,3 +44,7 @@ the custom layout have distinct names and can be re-deployed separately.
 The source snapshot was built/tested on the original local build checkout with
 the same runtime source bytes to reuse its existing compilation cache. Build
 tools, compiled binaries, user settings and AI history are excluded from Git.
+
+On the owner's PC the existing build checkout and portable tools now live under
+`.local/herdr-customization/` in this repository. Current local paths and the
+maintenance record are documented in [Local Herdr assets](LOCAL-HERDR-ASSETS.md).

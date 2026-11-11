@@ -3,6 +3,7 @@ mods/*/jsconfig.json
 mods/*/gpui-kit.d.ts
 
 # Build products and machine-local/private state
+.local/
 **/target/
 **/dist/
 build-tools/

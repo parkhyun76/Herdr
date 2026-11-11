@@ -29,14 +29,15 @@ automatic detection, recovery, and verified improvements.
 ## Working surfaces
 
 - Existing build/test surface:
-  `../Project-conductor/herdr-customization/herdr-app-source`.
+  `.local/herdr-customization/herdr-app-source` (relative to the configured source
+  `repository` in `auto-repair.json`, including when working in a repair worktree).
 - Complete publishable source snapshot: `native/herdr-app` in this repository;
   includes vendored libraries and a pinned Ghostty submodule at
   `291fd050b9e9c293c8adb6a140742649b7e42d3a`.
 - Keep runtime code changes synchronized into the publishable snapshot before
   committing. Keep user session/config/auth/log/backup data outside Git.
 - Required live maintenance record:
-  `../Project-conductor/HERDR-WINDOWS-IMPROVEMENTS.md`.
+  `.local/HERDR-WINDOWS-IMPROVEMENTS.md` (relative to that same source repository).
 - GitHub CLI authenticated as `parkhyun76`; destination is empty and private.
 - Never use the separate SSH account `DigitalAdvencedSensors` for this push.
 
