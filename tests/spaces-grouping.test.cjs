@@ -145,6 +145,20 @@ test('longer parent cycles never hide spaces while a space pointing into them st
   assert.deepEqual(ordered().map(row => [row.id, row.depth]), [['a', 0], ['d', 1], ['b', 0], ['c', 0]]);
 });
 
+test('a repo no space is in any more stops being watched so Windows can move its folder', () => {
+  const rows = [space('wf', '/wf/.git'), space('keep', '/shared/.git'), space('left', '/shared/.git')];
+  const panes = [];
+  const { view } = mount(rows, {}, new Map(), new Map(), panes);
+  for (const repo of ['/wf/.git', '/shared/.git']) view.watching.add(repo);
+  panes.push({ tab: 'tab-wf', cwd: '/parent' }, { tab: 'tab-left', cwd: '/elsewhere' });
+  view.git[JSON.stringify([null, '/parent'])] = null;
+  view.git[JSON.stringify([null, '/elsewhere'])] = null;
+  view.forgetGone();
+  assert.deepEqual([...view.watching], ['/shared/.git']);
+  assert.equal(JSON.stringify([null, '/wf']) in view.git, false);
+  assert.equal(JSON.stringify([null, '/keep']) in view.git, true);
+});
+
 test('changing native layout props preserves legacy folds despite a new localStorage namespace', () => {
   const rows = [space('master', null), space('role', null), space('verify', null)];
   const group = JSON.stringify([null, 'space', 'master']);

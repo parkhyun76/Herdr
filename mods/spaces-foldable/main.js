@@ -136,11 +136,25 @@ export default class Spaces extends View {
         this.pending.clear();
         for (const key of keys) await this.check(key, cx);
       }
-      const used = new Set(Object.values(this.git).filter(Boolean).map((g) => JSON.parse(g.repo)).filter(([on]) => !on).map(([, repo]) => repo));
-      for (const repo of this.watching) if (!used.has(repo)) this.watching.delete(repo);
+      this.forgetGone();
       this.refreshing = false;
       cx.notify();
     });
+  }
+
+  // Places no space is at any more are forgotten, and repos only they used stop
+  // being watched: a watch holds the folder open, and Windows then refuses to move it.
+  forgetGone() {
+    const ps = panes();
+    const live = new Set(spaces().map((s) => where(s, ps)));
+    for (const k of Object.keys(this.git)) {
+      if (live.has(k)) continue;
+      delete this.git[k];
+      delete this.checked[k];
+      this.unsure.delete(k);
+    }
+    const used = new Set(Object.values(this.git).filter(Boolean).map((g) => JSON.parse(g.repo)).filter(([on]) => !on).map(([, repo]) => repo));
+    for (const repo of this.watching) if (!used.has(repo)) this.watching.delete(repo);
   }
 
   // One place's git: branch, ahead/behind, its repo.
