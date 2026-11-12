@@ -1,5 +1,10 @@
 # Herdr changelog
 
+## [0.1.12-personal.4] - 2026-11-12
+
+### Fixed
+- Windows screenshot paste to Claude Code pastes the saved image path instead of Alt+V. Claude attaches it without starting PowerShell twice, so it is no longer slower than Codex.
+
 ## [0.1.12-personal.3] - 2026-11-11
 
 ### Fixed

@@ -64,7 +64,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("terminal.show", &[opt("terminal"), opt("pane")], "Show a terminal in a pane for now, in place of its own (no terminal: back)."),
     cmd("terminal.copy", &[], "Copy the focused terminal's selection."),
     cmd("terminal.paste", &[], "Paste into the focused terminal (copied files as if dropped; an image alone as terminal.paste_image pastes it)."),
-    cmd("terminal.paste_image", &[], "Paste a clipboard image (Ctrl+V or Alt+V). Windows bridges the image and sends Claude Code Alt+V, other programs Ctrl+V; text is pasted too. Remote terminals receive a file; other local systems send Ctrl+V."),
+    cmd("terminal.paste_image", &[], "Paste a clipboard image (Ctrl+V or Alt+V). Windows pastes Claude Code the saved image path and bridges the image to other programs with Ctrl+V; text is pasted too. Remote terminals receive a file; other local systems send Ctrl+V."),
     cmd("agent.focus", &[req("terminal")], "Show an agent (sub-agents too)."),
     cmd("agent.next", &[], "Show the next agent, in the order the agents list shows them."),
     cmd("agent.prev", &[], "Show the previous agent."),

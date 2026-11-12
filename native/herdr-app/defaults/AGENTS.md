@@ -578,9 +578,10 @@ The main ones:
   `terminal.show {terminal?, pane?}`, `terminal.copy`, `terminal.paste` (copied
   files, such as Finder's or a clipboard manager's image, as if dropped; an image
   alone as `terminal.paste_image` pastes it), `terminal.paste_image` (Ctrl+V, and
-  Alt+V on Windows: the GUI reads the image, a short unkept core helper transfers
-  it to the AI's Windows clipboard, then Alt+V is sent to Claude Code or Ctrl+V
-  to other programs, using the current program identity from core. Remote terminals
+  Alt+V on Windows: the GUI reads the image into a temporary file. Claude Code,
+  by the current program identity from core, gets that file's path pasted and
+  attaches it itself; other programs get it through a short unkept core helper
+  that transfers it to the AI's Windows clipboard, then Ctrl+V. Remote terminals
   receive an uploaded file path. Windows also pastes clipboard text. Other local systems
   send Ctrl+V to the program). TIFF and BMP clipboard
   images are converted to PNG before sending,

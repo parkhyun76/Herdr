@@ -550,8 +550,22 @@ impl TerminalView {
             }
         };
         if self.address.contains('/') { self.put_there(vec![path], true, cx); }
+        else if self.image_paste_key == CLAUDE_IMAGE_KEY { self.paste_image_path(path, cx); }
         else { self.bridge_image(path, cx); }
         true
+    }
+
+    /// Claude Code attaches an image whose path is pasted, reading the file
+    /// itself. Its own clipboard read starts PowerShell twice per paste, which
+    /// made Alt+V noticeably slower than Codex on Windows.
+    fn paste_image_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.dropped(vec![path.clone()], cx);
+        cx.spawn(async move |_, cx| {
+            // Claude reads the file as the paste arrives; keep it a while, then tidy up.
+            cx.background_executor().timer(PASTED_IMAGE_LIFETIME).await;
+            cx.background_executor().spawn(async move { let _ = std::fs::remove_file(&path); }).await;
+        })
+        .detach();
     }
 
     fn bridge_image(&self, path: PathBuf, cx: &mut Context<Self>) {
@@ -991,9 +1005,15 @@ fn fallback_icon(text: &str, font: &Font, ts: &gpui::TextSystem) -> Option<IconG
     icon_glyph(c)
 }
 
+/// Native Windows Claude Code's image paste key; it also marks Claude, whose
+/// local images are pasted as file paths instead (see `paste_image_path`).
+const CLAUDE_IMAGE_KEY: &str = "alt-v";
+/// How long a pasted image file stays for Claude Code to read it.
+const PASTED_IMAGE_LIFETIME: Duration = Duration::from_secs(120);
+
 pub fn image_paste_key(windows: bool, program: Option<&str>) -> &'static str {
     // Native Windows Claude Code binds image paste to Alt+V; Codex uses Ctrl+V.
-    if windows && program == Some("claude") { "alt-v" } else { "ctrl-v" }
+    if windows && program == Some("claude") { CLAUDE_IMAGE_KEY } else { "ctrl-v" }
 }
 
 fn paste_image_fallback(vt: &mut vt::Vt, text: Option<&str>, key: &str) -> Option<Vec<u8>> {
@@ -1993,6 +2013,8 @@ mod tests {
                 let key = super::image_paste_key(windows, program);
                 let alt = windows && program == Some("claude");
                 assert_eq!(key, if alt { "alt-v" } else { "ctrl-v" });
+                // Only Windows Claude Code gets local images as a pasted path.
+                assert_eq!(key == super::CLAUDE_IMAGE_KEY, alt);
                 for mode in [b"".as_slice(), b"\x1b[?9001h", b"\x1b[>1u"] {
                     let mut vt = Vt::new(20, 3);
                     vt.write(mode);
