@@ -1,5 +1,10 @@
 # Herdr changelog
 
+## [0.1.12-personal.5] - 2026-11-12
+
+### New
+- Holding Backspace for 4 seconds in Claude Code or Codex deletes everything before the cursor at once.
+
 ## [0.1.12-personal.4] - 2026-11-12
 
 ### Fixed

@@ -43,6 +43,8 @@ the selection before using Ctrl+C as an interrupt. Alt+V and Ctrl+V read images
 in the GUI session. Claude Code gets the saved image's path pasted (it attaches
 the file itself); other programs get the image bridged to the AI terminal's Windows
 clipboard, then Ctrl+V, so service-session agents work. Remote images use file upload.
+Holding Backspace for 4 seconds in Claude Code or Codex deletes everything before
+the cursor at once.
 
 For programs that cached the wrong input background, `settings.json` accepts
 `terminal_background_overrides`, an optional map of exact `#rrggbb` background

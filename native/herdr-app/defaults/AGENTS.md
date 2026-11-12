@@ -598,7 +598,8 @@ The main ones:
   Ctrl+C with a selected conversation copies locally and never sends the
   interrupt byte. The completed selection stays copyable through TUI redraws;
   typing, Esc or starting another selection clears it. Without a selection,
-  Ctrl+C keeps its normal interrupt behavior.
+  Ctrl+C keeps its normal interrupt behavior. In Claude Code and Codex, holding
+  Backspace for 4 seconds deletes everything before the cursor at once.
   ordinary clicks still reach mouse-tracking programs on release. Hold Ctrl to
   send a drag to the program instead. On other systems, mouse-tracking programs
   get their mouse events (hold Shift to select text instead). A drag stays with the terminal where it

@@ -1936,6 +1936,8 @@ impl AppWindow {
             v.cwd = cwd;
             v.right_click_to_program = to_program;
             v.image_paste_key = crate::terminal::image_paste_key(cfg!(windows), program);
+            v.backspace_hold_clears = crate::terminal::backspace_hold_clears(program);
+            if !v.backspace_hold_clears { v.stop_backspace_hold(); }
         });
     }
 
@@ -5014,6 +5016,8 @@ mod tests {
         ] {
             let program = super::program_of(&report, Some(&argv));
             assert_eq!(crate::terminal::image_paste_key(true, program["key"].as_str()), expected);
+            let agent = program["key"].as_str().is_some_and(|key| key == "claude" || key == "codex");
+            assert_eq!(crate::terminal::backspace_hold_clears(program["key"].as_str()), agent);
         }
     }
 

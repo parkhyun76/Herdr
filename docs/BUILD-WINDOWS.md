@@ -3,7 +3,7 @@
 This personal fork includes the complete Herdr app source and vendored Rust/GPUI
 libraries under `native/herdr-app`. It is based on `herdrdev/herdr-app` commit
 `4aa3460749947e7771aa39a8a2cec58d46649926` (`v0.1.12`), under Apache-2.0.
-The personal package is `0.1.12-personal.4`; previous native clipboard,
+The personal package is `0.1.12-personal.5`; previous native clipboard,
 background, conversation memory and diagnostic changes are preserved.
 Ghostty is a public pinned submodule at
 `291fd050b9e9c293c8adb6a140742649b7e42d3a`; its own license applies.

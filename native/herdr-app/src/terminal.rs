@@ -98,6 +98,11 @@ pub struct TerminalView {
     pub right_click_to_program: bool,
     /// Image shortcut for the program identified by the core's current facts.
     pub image_paste_key: &'static str,
+    /// Holding Backspace deletes everything before the cursor (Claude Code, Codex).
+    pub backspace_hold_clears: bool,
+    backspace_hold: BackspaceHold,
+    /// Sending the clearing presses; the next key press cancels the rest.
+    clearing: Option<Task<()>>,
     grid: Rc<RefCell<Grid>>,
     focus: FocusHandle,
     was_focused: bool,
@@ -195,6 +200,9 @@ impl TerminalView {
             link: None,
             right_click_to_program: false,
             image_paste_key: "ctrl-v",
+            backspace_hold_clears: false,
+            backspace_hold: BackspaceHold::default(),
+            clearing: None,
             grid: Rc::new(RefCell::new(Grid {
                 vt: Vt::new(size_hint.0.max(2), size_hint.1.max(1)),
                 core: core.clone(),
@@ -625,6 +633,18 @@ impl TerminalView {
             Some(LocalShortcut::PasteImage) => { self.paste_image(cx); cx.stop_propagation(); return; }
             None => {}
         }
+        if self.backspace_hold_clears {
+            let backspace = k.key == "backspace" && !k.modifiers.modified();
+            match self.backspace_hold.key(backspace, ev.is_held, Instant::now()) {
+                HeldBackspace::Type => { self.clearing = None; }
+                HeldBackspace::ClearBeforeCursor => {
+                    self.clear_before_cursor(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                HeldBackspace::Ignore => { cx.stop_propagation(); return; }
+            }
+        }
         // Typing clears a selection, as in Herdr.
         if !k.key.starts_with("shift") && !k.key.starts_with("control") && k.key != "ctrl" && !k.key.starts_with("alt") {
             self.selection_copy = None;
@@ -635,6 +655,24 @@ impl TerminalView {
             self.send(&bytes);
             cx.stop_propagation();
         }
+    }
+
+    /// Forgets a Backspace hold and stops clearing: other input or focus came between.
+    pub fn stop_backspace_hold(&mut self) {
+        self.backspace_hold = BackspaceHold::default();
+        self.clearing = None;
+    }
+
+    /// Sends the Ctrl+U presses a few at a time: Claude Code reads one large
+    /// burst as pasted text and drops it (measured: 50 at once work, 64 don't).
+    fn clear_before_cursor(&mut self, cx: &mut Context<Self>) {
+        let Some(writes) = clear_before_cursor_writes(&mut self.grid.borrow_mut().vt) else { return };
+        self.clearing = Some(cx.spawn(async move |this, cx| {
+            for write in writes {
+                if this.update(cx, |this, _| this.send(&write)).is_err() { return; }
+                cx.background_executor().timer(BACKSPACE_CLEAR_GAP).await;
+            }
+        }));
     }
 
     fn scroll(&mut self, ev: &ScrollWheelEvent, _w: &mut Window, cx: &mut Context<Self>) {
@@ -1014,6 +1052,75 @@ const PASTED_IMAGE_LIFETIME: Duration = Duration::from_secs(120);
 pub fn image_paste_key(windows: bool, program: Option<&str>) -> &'static str {
     // Native Windows Claude Code binds image paste to Alt+V; Codex uses Ctrl+V.
     if windows && program == Some("claude") { CLAUDE_IMAGE_KEY } else { "ctrl-v" }
+}
+
+/// How long Backspace is held before everything before the cursor goes at once.
+const BACKSPACE_CLEAR_HOLD: Duration = Duration::from_secs(4);
+/// Ctrl+U presses sent then. In Claude Code and Codex each deletes the text
+/// before the cursor on its line, or the line break before it, so enough of
+/// them empty everything before the cursor; extras do nothing.
+const BACKSPACE_CLEAR_PRESSES: usize = 200;
+/// Presses per write, and the pause between writes, so each write reads as typing.
+const BACKSPACE_CLEAR_GROUP: usize = 16;
+const BACKSPACE_CLEAR_GAP: Duration = Duration::from_millis(15);
+
+/// Whether holding Backspace clears the prompt before the cursor: the coding
+/// agents whose prompt deletes a line with Ctrl+U (checked on both).
+pub fn backspace_hold_clears(program: Option<&str>) -> bool {
+    matches!(program, Some("claude" | "codex"))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HeldBackspace {
+    /// Send the key as usual.
+    Type,
+    /// Held long enough: delete everything before the cursor.
+    ClearBeforeCursor,
+    /// Still held after clearing: nothing is left to delete.
+    Ignore,
+}
+
+/// Longest pause between a hold's key events (Windows waits up to 1 s before
+/// repeating): a repeat after a longer gap starts a new count, so an old press
+/// never makes a later hold clear at once.
+const BACKSPACE_REPEAT_GAP: Duration = Duration::from_millis(1_200);
+
+/// Follows one Backspace hold through the keyboard's repeats.
+#[derive(Default)]
+struct BackspaceHold {
+    since: Option<Instant>,
+    last: Option<Instant>,
+    cleared: bool,
+}
+
+impl BackspaceHold {
+    fn key(&mut self, backspace: bool, repeat: bool, now: Instant) -> HeldBackspace {
+        let continues = backspace && repeat && self.last.is_some_and(|last| now.duration_since(last) <= BACKSPACE_REPEAT_GAP);
+        let since = self.since.filter(|_| continues);
+        self.last = backspace.then_some(now);
+        let Some(since) = since else {
+            // A new press (or a repeat after a gap) starts the count; any other key ends it.
+            self.since = self.last;
+            self.cleared = false;
+            return HeldBackspace::Type;
+        };
+        if self.cleared {
+            HeldBackspace::Ignore
+        } else if now.duration_since(since) >= BACKSPACE_CLEAR_HOLD {
+            self.cleared = true;
+            HeldBackspace::ClearBeforeCursor
+        } else {
+            HeldBackspace::Type
+        }
+    }
+}
+
+/// The Ctrl+U presses, in the program's keyboard mode, grouped into writes.
+fn clear_before_cursor_writes(vt: &mut vt::Vt) -> Option<Vec<Vec<u8>>> {
+    let keystroke = Keystroke::parse("ctrl-u").ok()?;
+    let press = key_bytes(vt, &KeyDownEvent { keystroke, is_held: false, prefer_character_input: false })?;
+    let groups = BACKSPACE_CLEAR_PRESSES.div_ceil(BACKSPACE_CLEAR_GROUP);
+    Some((0..groups).map(|i| press.repeat(BACKSPACE_CLEAR_GROUP.min(BACKSPACE_CLEAR_PRESSES - i * BACKSPACE_CLEAR_GROUP))).collect())
 }
 
 fn paste_image_fallback(vt: &mut vt::Vt, text: Option<&str>, key: &str) -> Option<Vec<u8>> {
@@ -1464,6 +1571,7 @@ impl EntityInputHandler for TerminalView {
     }
 
     fn replace_text_in_range(&mut self, _range: Option<std::ops::Range<usize>>, text: &str, _w: &mut Window, cx: &mut Context<Self>) {
+        self.stop_backspace_hold();
         self.grid.borrow_mut().marked = None;
         self.send(text.as_bytes());
         cx.notify();
@@ -1477,6 +1585,7 @@ impl EntityInputHandler for TerminalView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.stop_backspace_hold();
         self.grid.borrow_mut().marked = (!text.is_empty()).then(|| text.to_owned());
         cx.notify();
     }
@@ -1498,6 +1607,7 @@ impl Render for TerminalView {
         let focused = self.focus.is_focused(window);
         if focused != self.was_focused {
             self.was_focused = focused;
+            self.stop_backspace_hold();
             let g = self.grid.borrow();
             if let Some(ch) = g.channel {
                 g.core.focus(ch, focused);
@@ -2024,6 +2134,71 @@ mod tests {
                     assert_eq!(super::paste_image_fallback(&mut vt, None, key).unwrap(), expected);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn holding_backspace_four_seconds_clears_before_the_cursor_once() {
+        use super::{BackspaceHold, HeldBackspace::*};
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        // Key repeats, as Windows sends them while the key stays down.
+        let repeat = |hold: &mut BackspaceHold, from: u64, to: u64| {
+            (from..=to).step_by(25).map(|ms| hold.key(true, true, at(ms))).collect::<Vec<_>>()
+        };
+        let mut hold = BackspaceHold::default();
+        assert_eq!(hold.key(true, false, at(0)), Type);
+        assert!(repeat(&mut hold, 500, 3_975).iter().all(|r| *r == Type), "under 4 s it deletes one at a time");
+        assert_eq!(hold.key(true, true, at(4_000)), ClearBeforeCursor);
+        assert!(repeat(&mut hold, 4_025, 6_000).iter().all(|r| *r == Ignore), "the rest of the hold sends nothing");
+        // Released and pressed again: an ordinary Backspace that counts afresh.
+        assert_eq!(hold.key(true, false, at(7_000)), Type);
+        assert!(repeat(&mut hold, 7_500, 10_975).iter().all(|r| *r == Type));
+        assert_eq!(hold.key(true, true, at(11_000)), ClearBeforeCursor);
+
+        // Another key in between restarts the count.
+        let mut hold = BackspaceHold::default();
+        assert_eq!(hold.key(true, false, at(0)), Type);
+        repeat(&mut hold, 500, 3_000);
+        assert_eq!(hold.key(false, false, at(3_100)), Type);
+        assert_eq!(hold.key(true, true, at(3_200)), Type, "a repeat without its press starts the count");
+        assert!(repeat(&mut hold, 3_225, 7_175).iter().all(|r| *r == Type));
+        assert_eq!(hold.key(true, true, at(7_200)), ClearBeforeCursor);
+
+        // A lone press long ago (its release unseen, e.g. typed through the IME
+        // since) doesn't make a later hold clear at once.
+        let mut hold = BackspaceHold::default();
+        assert_eq!(hold.key(true, false, at(0)), Type);
+        assert_eq!(hold.key(true, true, at(10_000)), Type);
+        assert!(repeat(&mut hold, 10_025, 13_975).iter().all(|r| *r == Type));
+        assert_eq!(hold.key(true, true, at(14_000)), ClearBeforeCursor);
+        // Windows' longest wait before the first repeat (1 s) still counts from the press.
+        let mut hold = BackspaceHold::default();
+        assert_eq!(hold.key(true, false, at(0)), Type);
+        assert!(repeat(&mut hold, 1_000, 3_975).iter().all(|r| *r == Type));
+        assert_eq!(hold.key(true, true, at(4_000)), ClearBeforeCursor);
+    }
+
+    #[test]
+    fn clearing_before_the_cursor_sends_ctrl_u_in_small_writes_in_each_keyboard_mode() {
+        use super::{BACKSPACE_CLEAR_GROUP, BACKSPACE_CLEAR_PRESSES};
+        let windows_ctrl_u = {
+            let mut vt = Vt::new(20, 3);
+            vt.write(b"\x1b[?9001h");
+            key_bytes(&mut vt, &press("ctrl-u", None)).unwrap()
+        };
+        for (mode, press) in [(b"".as_slice(), b"\x15".to_vec()), (b"\x1b[>1u", b"\x1b[117;5u".to_vec()), (b"\x1b[?9001h", windows_ctrl_u)] {
+            let mut vt = Vt::new(20, 3);
+            vt.write(mode);
+            let writes = super::clear_before_cursor_writes(&mut vt).unwrap();
+            // Claude Code drops one large burst as a paste; it took 50 at once, not 64.
+            const { assert!(BACKSPACE_CLEAR_GROUP <= 50) };
+            assert!(writes.iter().all(|w| !w.is_empty() && w.len() <= press.len() * BACKSPACE_CLEAR_GROUP));
+            assert_eq!(writes.concat(), press.repeat(BACKSPACE_CLEAR_PRESSES));
+        }
+        for (program, clears) in [(Some("claude"), true), (Some("codex"), true), (Some("shell"), false), (Some("pi"), false), (None, false)] {
+            assert_eq!(super::backspace_hold_clears(program), clears);
         }
     }
 
