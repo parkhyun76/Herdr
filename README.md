@@ -19,7 +19,7 @@ Jev 연동은 Herdr의 Claude Code·Codex 요청을 자동 분류하고 현재 A
 [배포 안내](docs/DISTRIBUTION-WINDOWS.md)를 따른다. `dist/`의 실행 파일은 Git에 커밋하지 않는다.
 
 기존 0.1.11 Windows 실행 파일은 [개인 개선판 릴리스](https://github.com/parkhyun76/Herdr/releases/tag/windows-custom-20261102)에서 받는다.
-현재 소스는 공식 0.1.12를 합친 `0.1.12-personal.5`이며 빌드 방법은 위 안내를 따른다.
+현재 소스는 공식 0.1.12를 합친 `0.1.12-personal.6`이며 빌드 방법은 위 안내를 따른다.
 Windows 캡처 이미지 붙여넣기(Alt+V/Ctrl+V)는 Claude Code에 저장한 이미지 파일 경로를 붙여넣고(PowerShell 없이 바로 첨부), Codex에는 클립보드로 전달한 뒤 Ctrl+V를 보낸다.
 Claude Code·Codex 입력란에서 Backspace를 4초 이상 누르고 있으면 커서 앞의 글 전체를 한꺼번에 지운다(Claude Code는 Ctrl+Y로 되살림).
 공식 앱·core와 구분되는 개인 빌드이며 기존 core 설치가 필요하다.

@@ -1,5 +1,10 @@
 # Herdr changelog
 
+## [0.1.12-personal.6] - 2026-11-13
+
+### Fixed
+- Holding Backspace in Claude Code no longer leaves some text behind: Herdr waits for Claude to redraw before sending more.
+
 ## [0.1.12-personal.5] - 2026-11-12
 
 ### New

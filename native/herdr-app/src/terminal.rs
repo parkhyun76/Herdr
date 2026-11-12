@@ -103,6 +103,8 @@ pub struct TerminalView {
     backspace_hold: BackspaceHold,
     /// Sending the clearing presses; the next key press cancels the rest.
     clearing: Option<Task<()>>,
+    /// When the program last printed, to pace the clearing presses.
+    output_at: Cell<Option<Instant>>,
     grid: Rc<RefCell<Grid>>,
     focus: FocusHandle,
     was_focused: bool,
@@ -203,6 +205,7 @@ impl TerminalView {
             backspace_hold_clears: false,
             backspace_hold: BackspaceHold::default(),
             clearing: None,
+            output_at: Cell::new(None),
             grid: Rc::new(RefCell::new(Grid {
                 vt: Vt::new(size_hint.0.max(2), size_hint.1.max(1)),
                 core: core.clone(),
@@ -370,6 +373,7 @@ impl TerminalView {
             for item in batch {
                 match item {
                     Stream::Data(bytes) => {
+                        self.output_at.set(Some(Instant::now()));
                         g.vt.allow_clipboard_write(crate::settings::get().clipboard_write);
                         g.vt.write(&bytes);
                         let [clipboard, primary] = g.vt.take_clipboard();
@@ -663,14 +667,29 @@ impl TerminalView {
         self.clearing = None;
     }
 
-    /// Sends the Ctrl+U presses a few at a time: Claude Code reads one large
-    /// burst as pasted text and drops it (measured: 50 at once work, 64 don't).
+    /// Sends the Ctrl+U presses a few at a time, each group only once the
+    /// program has drawn the last: Claude Code loses presses that reach it
+    /// together in large numbers (measured: two groups of 16 sent back to back
+    /// lost about 10, while it lagged behind a held Backspace). A group the
+    /// program doesn't redraw for means nothing was left to delete.
     fn clear_before_cursor(&mut self, cx: &mut Context<Self>) {
         let Some(writes) = clear_before_cursor_writes(&mut self.grid.borrow_mut().vt) else { return };
         self.clearing = Some(cx.spawn(async move |this, cx| {
             for write in writes {
+                let waiting = Instant::now();
+                loop {
+                    let Ok(output_at) = this.update(cx, |this, _| this.output_at.get()) else { return };
+                    if output_settled(output_at, Instant::now()) || waiting.elapsed() >= BACKSPACE_CLEAR_SETTLE_LIMIT { break; }
+                    cx.background_executor().timer(BACKSPACE_CLEAR_POLL).await;
+                }
+                let sent = Instant::now();
                 if this.update(cx, |this, _| this.send(&write)).is_err() { return; }
-                cx.background_executor().timer(BACKSPACE_CLEAR_GAP).await;
+                loop {
+                    cx.background_executor().timer(BACKSPACE_CLEAR_POLL).await;
+                    let Ok(output_at) = this.update(cx, |this, _| this.output_at.get()) else { return };
+                    if output_at.is_some_and(|at| at > sent) { break; }
+                    if sent.elapsed() >= BACKSPACE_CLEAR_ANSWER { return; }
+                }
             }
         }));
     }
@@ -1060,9 +1079,20 @@ const BACKSPACE_CLEAR_HOLD: Duration = Duration::from_secs(4);
 /// before the cursor on its line, or the line break before it, so enough of
 /// them empty everything before the cursor; extras do nothing.
 const BACKSPACE_CLEAR_PRESSES: usize = 200;
-/// Presses per write, and the pause between writes, so each write reads as typing.
+/// Presses per write: Claude Code took groups of 16 reliably, not of 32.
 const BACKSPACE_CLEAR_GROUP: usize = 16;
-const BACKSPACE_CLEAR_GAP: Duration = Duration::from_millis(15);
+/// The program's output has been quiet this long: it has drawn what it read.
+const BACKSPACE_CLEAR_SETTLE: Duration = Duration::from_millis(30);
+/// Longest wait for quiet (a spinner never stops); the group goes anyway.
+const BACKSPACE_CLEAR_SETTLE_LIMIT: Duration = Duration::from_secs(1);
+/// No output this long after a group: the prompt had nothing left to delete.
+const BACKSPACE_CLEAR_ANSWER: Duration = Duration::from_millis(500);
+const BACKSPACE_CLEAR_POLL: Duration = Duration::from_millis(5);
+
+/// The program has drawn what it was sent: no output yet, or none lately.
+fn output_settled(output_at: Option<Instant>, now: Instant) -> bool {
+    output_at.is_none_or(|at| now.saturating_duration_since(at) >= BACKSPACE_CLEAR_SETTLE)
+}
 
 /// Whether holding Backspace clears the prompt before the cursor: the coding
 /// agents whose prompt deletes a line with Ctrl+U (checked on both).
@@ -2192,14 +2222,24 @@ mod tests {
             let mut vt = Vt::new(20, 3);
             vt.write(mode);
             let writes = super::clear_before_cursor_writes(&mut vt).unwrap();
-            // Claude Code drops one large burst as a paste; it took 50 at once, not 64.
-            const { assert!(BACKSPACE_CLEAR_GROUP <= 50) };
+            // Claude Code loses presses that arrive in large numbers together (32 at once did).
+            const { assert!(BACKSPACE_CLEAR_GROUP <= 16) };
             assert!(writes.iter().all(|w| !w.is_empty() && w.len() <= press.len() * BACKSPACE_CLEAR_GROUP));
             assert_eq!(writes.concat(), press.repeat(BACKSPACE_CLEAR_PRESSES));
         }
         for (program, clears) in [(Some("claude"), true), (Some("codex"), true), (Some("shell"), false), (Some("pi"), false), (None, false)] {
             assert_eq!(super::backspace_hold_clears(program), clears);
         }
+    }
+
+    #[test]
+    fn clearing_waits_until_the_program_has_drawn_the_last_group() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        assert!(super::output_settled(None, now), "a quiet program needs no wait");
+        assert!(!super::output_settled(Some(now - Duration::from_millis(10)), now), "still drawing");
+        assert!(super::output_settled(Some(now - super::BACKSPACE_CLEAR_SETTLE), now));
+        assert!(!super::output_settled(Some(now + Duration::from_millis(1)), now), "output stamped after now is fresh");
     }
 
     #[cfg(target_os = "macos")]
