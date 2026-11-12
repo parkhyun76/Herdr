@@ -10,7 +10,7 @@ function location() {
   return { cwd: pane?.cwd || f?.cwd || space?.folder, on, space: space?.id };
 }
 const key = () => JSON.stringify(location());
-const PER_FOLDER = 500, TOTAL = 5000;
+const PER_FOLDER = 500, TOTAL = 5000, DEFAULT_FOLDER = "새 폴더";
 
 function parentFolder(path, windows) {
   if (!path) return null;
@@ -90,8 +90,9 @@ async function directory(path, on) {
 
 async function makeFolder(parent, name, on) {
   const r = !on && window()?.platform === "windows"
-    ? await exec("powershell", ["-NoProfile", "-NonInteractive", "-File", `${appHome()}/mods/files-utf8/new-folder-windows.ps1`, "-Parent", parent, "-Name", name])
-    : await exec("mkdir", [joinPath(parent, name)], { on });
+    // `-Name:value` keeps a name such as "-draft" from being read as a parameter.
+    ? await exec("powershell", ["-NoProfile", "-NonInteractive", "-File", `${appHome()}/mods/files-utf8/new-folder-windows.ps1`, `-Parent:${parent}`, `-Name:${name}`])
+    : await exec("mkdir", ["--", joinPath(parent, name)], { on });
   if (r.code !== 0) throw new Error(r.stderr?.trim() || "폴더를 만들 수 없습니다");
 }
 
@@ -100,7 +101,7 @@ export default class Files extends View {
     this.saved = new Map();
     this.drives = []; this.driveMenu = false; this.driveAt = 0; this.driveFocus = cx.focus_handle();
     this.entries = []; this.marks = {}; this.selected = null; this.creating = null;
-    this.nameInput = InputState.new({ placeholder: "새 폴더 이름" });
+    this.nameInput = InputState.new({ placeholder: `${DEFAULT_FOLDER} (이름 입력 후 Enter)` });
     this.nameInput.on("submit", (_e, cx) => this.createFolder(cx));
     this.refresh(cx);
     cx.timer.every(10000, cx => this.refresh(cx));
@@ -142,7 +143,7 @@ export default class Files extends View {
         const iconError = entries.find(entry => entry.iconError)?.iconError;
         if (iconError) this.iconError = `Windows 아이콘을 읽지 못해 기본 아이콘을 표시합니다: ${iconError}`;
         this.limited = entries.length > PER_FOLDER;
-        this.entries = entries.slice(0, PER_FOLDER).sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name));
+        this.entries = entries.sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name)).slice(0, PER_FOLDER);
         if (this.selected && !this.entries.some(e => e.dir && e.name === this.selected)) this.selected = null;
         const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }).catch(() => null);
         const marks = {};
@@ -155,7 +156,10 @@ export default class Files extends View {
           }
         }
         if (!this.current(context)) return;
-        this.marks = marks; this.error = null; this.watch(cwd, cx);
+        this.marks = marks; this.error = null;
+        // Native folder watches last until restart and hold the folder, so only the terminal's folder is watched;
+        // browsed folders refresh on the timer.
+        if (cwd === location().cwd) this.watch(cwd, cx);
       } catch (e) { if (this.current(context)) this.error = String(e); }
       finally { if (this.context === context) this.loading = false; cx.notify(); }
     });
@@ -220,8 +224,10 @@ export default class Files extends View {
     if (!this.root) return;
     const parent = this.selected ? joinPath(this.root, this.selected) : this.root;
     this.creating = { parent, context: this.context, label: this.selected ?? pathCrumbs(this.root, !this.on && window()?.platform === "windows").at(-1)?.label ?? this.root };
-    this.nameInput.set_value("새 폴더");
+    this.nameInput.set_value("");
     this.nameInput.focus();
+    // The box is drawn on the next frame; focus it again once it exists.
+    cx.timer.after(30, () => this.nameInput.focus());
     cx.notify();
   }
 
@@ -233,7 +239,7 @@ export default class Files extends View {
   createFolder(cx) {
     const creating = this.creating;
     if (!creating || creating.busy) return;
-    const name = this.nameInput.value().trim(), windows = !creating.context.on && window()?.platform === "windows";
+    const name = this.nameInput.value().trim() || DEFAULT_FOLDER, windows = !creating.context.on && window()?.platform === "windows";
     const problem = folderNameError(name, windows);
     if (problem) { notify({ title: "새 폴더", body: problem, level: "error", timeout: 8000 }); return; }
     creating.busy = true;
@@ -241,10 +247,9 @@ export default class Files extends View {
       try {
         await makeFolder(creating.parent, name, creating.context.on);
         if (this.creating === creating) this.creating = null;
-        if (!this.current(creating.context)) return;
-        // Show the new folder: enter the selected folder it was made in, then select it.
-        if (creating.parent !== this.root) this.refresh(cx, creating.parent);
-        else this.refresh(cx);
+        if (!this.current(creating.context)) { notify({ title: "새 폴더를 만들었습니다", body: joinPath(creating.parent, name), timeout: 5000 }); return; }
+        // Show the new folder: list the folder it was made in afresh (even mid-refresh), then select it.
+        this.refresh(cx, creating.parent);
         this.selected = name;
       } catch (error) {
         creating.busy = false;

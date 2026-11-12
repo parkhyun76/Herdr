@@ -20,7 +20,7 @@ function load(overrides = {}) {
 }
 function fakeCx() {
   const tasks = [];
-  return { tasks, cx: { spawn: f => tasks.push(f), notify() {} } };
+  return { tasks, cx: { spawn: f => tasks.push(f), notify() {}, timer: { after: (_ms, f) => tasks.push(f) } } };
 }
 
 test('a file opens only on double click, with the exact Windows path and no preview', async () => {
@@ -101,12 +101,17 @@ test('a new folder goes in the selected folder captured when the box opened, whi
   view.current = c => c === view.context;
   const { tasks, cx } = fakeCx();
   view.startCreate(cx);
-  assert.equal(focused, true); assert.equal(value, '새 폴더');
-  view.selected = null; value = '  회의록  ';
+  assert.equal(focused, true); assert.equal(value, '');
+  focused = false; await tasks.shift()(cx); assert.equal(focused, true, 'focus again once the box is drawn');
+  view.selected = null; value = '  -회의록  ';
   view.createFolder(cx); await tasks.shift()(cx);
-  assert.deepEqual([...calls[0][1].slice(-4)], ['-Parent', 'D:\\work\\docs', '-Name', '회의록']);
+  assert.deepEqual([...calls[0][1].slice(-2)], ['-Parent:D:\\work\\docs', '-Name:-회의록']);
   assert.deepEqual(refreshed, ['D:\\work\\docs']);
-  assert.equal(view.selected, '회의록'); assert.equal(view.creating, null);
+  assert.equal(view.selected, '-회의록'); assert.equal(view.creating, null);
+  view.selected = null; view.startCreate(cx); tasks.length = 0; value = '   ';
+  view.createFolder(cx); await tasks.shift()(cx);
+  assert.equal(calls[1][1].at(-1), '-Name:새 폴더', 'an empty name uses the default');
+  assert.deepEqual(refreshed, ['D:\\work\\docs', 'D:\\work'], 'the same folder is listed afresh even mid-refresh');
 });
 
 const helperEnv = (extra) => ({ ...process.env, ...extra });
@@ -129,7 +134,7 @@ test('Windows helper passes special-character paths as a single literal argument
 test('Windows new-folder helper creates literal names and refuses existing or invalid ones', { skip: process.platform !== 'win32' }, () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'herdr-newfolder-'));
   const helper = path.resolve(__dirname, '../mods/files-utf8/new-folder-windows.ps1');
-  const make = (parent, name) => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', helper, '-Parent', parent, '-Name', name],
+  const make = (parent, name) => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', helper, `-Parent:${parent}`, `-Name:${name}`],
     { encoding: 'utf8', windowsHide: true });
   try {
     const parent = path.join(dir, "상위 ' $폴더"); fs.mkdirSync(parent);
@@ -138,6 +143,8 @@ test('Windows new-folder helper creates literal names and refuses existing or in
     assert.equal(r.status, 0, r.stderr);
     assert.ok(fs.statSync(path.join(parent, name)).isDirectory());
     assert.deepEqual(fs.readdirSync(parent), [name]);
+    r = make(parent, '-draft');
+    assert.equal(r.status, 0, r.stderr); assert.ok(fs.statSync(path.join(parent, '-draft')).isDirectory());
     r = make(parent, name);
     assert.notEqual(r.status, 0); assert.match(r.stderr, /이미 있습니다/);
     r = make(parent, '..\\escape');
